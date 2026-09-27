@@ -2,14 +2,14 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Archive, UserPlus, Users, X } from "lucide-react";
+import { Archive, Rocket, UserPlus, Users, X } from "lucide-react";
 import { toast } from "sonner";
 import { Avatar } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTrigger } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/input";
 import type { ProfileLite } from "@/lib/types";
-import { archiveProject, setProjectMember } from "../actions";
+import { activateProject, archiveProject, requestProjectLaunch, setProjectMember } from "../actions";
 
 const ROLES = { lead: "Responsable", member: "Contributeur", viewer: "Lecteur" } as const;
 
@@ -67,6 +67,33 @@ export function ArchiveProjectButton({ id }: { id: string }) {
       });
     }}>
       <Archive className="h-4 w-4" />
+    </Button>
+  );
+}
+
+/**
+ * Lancement d'un projet : il faut l'accord du CEO. Une fois l'accord obtenu, le
+ * chef de projet acte le démarrage.
+ */
+export function LaunchProjectButton({ id, approved, pending: waiting }: { id: string; approved: boolean; pending: boolean }) {
+  const [busy, start] = useTransition();
+  const router = useRouter();
+  const run = (fn: () => Promise<{ ok: boolean; message?: string; error?: string }>) =>
+    start(async () => {
+      const r = await fn();
+      if (r.ok) { toast.success(r.message); router.refresh(); } else toast.error(r.error);
+    });
+
+  if (approved) {
+    return (
+      <Button size="sm" loading={busy} onClick={() => run(() => activateProject(id))}>
+        <Rocket className="h-4 w-4" /> Lancer le projet
+      </Button>
+    );
+  }
+  return (
+    <Button size="sm" variant="outline" loading={busy} disabled={waiting} onClick={() => run(() => requestProjectLaunch(id))}>
+      <Rocket className="h-4 w-4" /> {waiting ? "En attente du CEO" : "Demander le lancement"}
     </Button>
   );
 }

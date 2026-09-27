@@ -11,7 +11,7 @@ export default async function MessagesLayout({ children }: { children: React.Rea
   const supabase = await createClient();
   const [{ data }, people] = await Promise.all([supabase.rpc("my_channels"), getPeople()]);
   return (
-    <div className="-mx-4 -my-6 flex h-[calc(100dvh-4rem)] overflow-hidden border-border bg-surface sm:-mx-6 lg:-mx-8 lg:-my-8">
+    <div className="-mx-4 -mb-24 -mt-5 flex h-[calc(100dvh-7rem)] overflow-hidden border-border bg-surface sm:-mx-6 sm:-mt-6 lg:-mx-8 lg:-mb-10 lg:-mt-8 lg:h-[calc(100dvh-4rem)]">
       <ChannelList channels={(data as ChannelSummary[]) ?? []} people={people.filter((p) => p.id !== ctx.userId)} userId={ctx.userId} />
       <section className="flex min-w-0 flex-1 flex-col">{children}</section>
     </div>

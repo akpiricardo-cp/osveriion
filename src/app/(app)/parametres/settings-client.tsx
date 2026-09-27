@@ -1,19 +1,20 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Camera, KeyRound, Laptop, LogOut, ShieldCheck, ShieldX, Smartphone } from "lucide-react";
+import { Camera, KeyRound, Laptop, Lock, LogOut, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { Button, ButtonLink } from "@/components/ui/button";
+import { Button } from "@/components/ui/button";
 import { Card, CardHeader } from "@/components/ui/card";
 import { ActionForm } from "@/components/ui/action-form";
 import { Field, Input, Textarea } from "@/components/ui/input";
 import type { Profile } from "@/lib/types";
-import { dateFr } from "@/lib/utils";
+import { logout } from "@/lib/logout";
 import { updateProfile } from "../annuaire/actions";
+import { changeAccessCode, lockSpaceNow } from "./actions";
 
 export function ProfileSettings({ profile: p }: { profile: Profile }) {
   const router = useRouter();
@@ -53,9 +54,9 @@ export function ProfileSettings({ profile: p }: { profile: Profile }) {
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Prénom" htmlFor="first_name"><Input id="first_name" name="first_name" defaultValue={p.first_name} required /></Field>
             <Field label="Nom" htmlFor="last_name"><Input id="last_name" name="last_name" defaultValue={p.last_name} /></Field>
-            <Field label="Intitulé de poste" htmlFor="job_title"><Input id="job_title" name="job_title" defaultValue={p.job_title ?? ""} /></Field>
-            <Field label="Téléphone" htmlFor="phone"><Input id="phone" name="phone" defaultValue={p.phone ?? ""} /></Field>
-            <Field label="Localisation" htmlFor="location"><Input id="location" name="location" defaultValue={p.location ?? ""} /></Field>
+            <Field label="Intitulé de poste" htmlFor="job_title" hint="Attribué automatiquement à votre nomination."><Input id="job_title" value={p.job_title ?? "—"} disabled /></Field>
+            <Field label="Téléphone" htmlFor="phone" required><Input id="phone" name="phone" type="tel" required defaultValue={p.phone ?? ""} /></Field>
+            <Field label="Localisation" htmlFor="location" required><Input id="location" name="location" required defaultValue={p.location ?? ""} placeholder="Cotonou, Bénin" /></Field>
             <Field label="E-mail" htmlFor="email" hint="Géré par l'administration."><Input id="email" value={p.email} disabled /></Field>
           </div>
           <Field label="Présentation" htmlFor="bio"><Textarea id="bio" name="bio" rows={3} defaultValue={p.bio ?? ""} /></Field>
@@ -65,11 +66,11 @@ export function ProfileSettings({ profile: p }: { profile: Profile }) {
   );
 }
 
-export function SecuritySettings({ factors, email }: { factors: { id: string; name: string; status: string; created_at: string }[]; email: string }) {
+export function SecuritySettings({ hasCode, email }: { hasCode: boolean; email: string }) {
   const router = useRouter();
   const [pwd, setPwd] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  const verified = factors.filter((f) => f.status === "verified");
+  const [locking, startLocking] = useTransition();
 
   async function changePassword(e: React.FormEvent) {
     e.preventDefault();
@@ -80,16 +81,6 @@ export function SecuritySettings({ factors, email }: { factors: { id: string; na
     if (error) return toast.error(error.message);
     setPwd("");
     toast.success("Mot de passe modifié.");
-  }
-
-  async function removeFactor(id: string) {
-    if (process.env.NEXT_PUBLIC_REQUIRE_MFA !== "false" && verified.length <= 1 && !confirm("La double authentification est obligatoire : vous devrez en configurer une nouvelle immédiatement. Continuer ?")) return;
-    setBusy(id);
-    const { error } = await createClient().auth.mfa.unenroll({ factorId: id });
-    setBusy(null);
-    if (error) return toast.error(error.message);
-    toast.success("Facteur supprimé.");
-    router.refresh();
   }
 
   async function signOutOthers() {
@@ -103,17 +94,35 @@ export function SecuritySettings({ factors, email }: { factors: { id: string; na
   return (
     <div className="space-y-6">
       <Card>
-        <CardHeader title="Double authentification" description="Protège votre compte même si votre mot de passe est compromis." icon={<ShieldCheck className="h-4 w-4" />}
-          action={verified.length ? <Badge tone="green" dot>Activée</Badge> : <Badge tone="red" dot>Désactivée</Badge>} />
-        <div className="space-y-3 p-5">
-          {verified.map((f) => (
-            <div key={f.id} className="flex items-center gap-3 rounded-xl border border-border p-3">
-              <Smartphone className="h-5 w-5 text-primary" />
-              <div className="flex-1"><p className="text-sm font-medium text-fg">Application d&apos;authentification</p><p className="text-xs text-subtle">Ajoutée le {dateFr(f.created_at)}</p></div>
-              <Button size="sm" variant="ghost" loading={busy === f.id} onClick={() => removeFactor(f.id)}><ShieldX className="h-4 w-4" /> Retirer</Button>
+        <CardHeader
+          title="Code d'accès"
+          description="Connu de vous seul, il est demandé à chaque nouvelle session pour rouvrir votre espace — sans jamais vous déconnecter."
+          icon={<ShieldCheck className="h-4 w-4" />}
+          action={hasCode ? <Badge tone="green" dot>Défini</Badge> : <Badge tone="red" dot>À définir</Badge>}
+        />
+        <div className="p-5">
+          <ActionForm
+            action={changeAccessCode}
+            submitLabel={hasCode ? "Changer le code" : "Définir le code"}
+            onSuccess={() => router.refresh()}
+          >
+            <div className="grid gap-4 sm:grid-cols-2">
+              {hasCode && (
+                <Field label="Code actuel" htmlFor="current" className="sm:col-span-2">
+                  <Input id="current" name="current" type="password" required autoComplete="off" maxLength={32} />
+                </Field>
+              )}
+              <Field label="Nouveau code" htmlFor="code" hint="6 à 32 caractères, sans espace.">
+                <Input id="code" name="code" type="password" required autoComplete="new-password" minLength={6} maxLength={32} />
+              </Field>
+              <Field label="Confirmation" htmlFor="confirm">
+                <Input id="confirm" name="confirm" type="password" required autoComplete="new-password" minLength={6} maxLength={32} />
+              </Field>
             </div>
-          ))}
-          {verified.length === 0 && <ButtonLink href="/mfa/activation" size="sm">Activer la double authentification</ButtonLink>}
+          </ActionForm>
+          <p className="mt-4 text-xs text-subtle">
+            Code oublié ? Un administrateur peut le réinitialiser : vous en choisirez un nouveau à votre prochaine ouverture.
+          </p>
         </div>
       </Card>
 
@@ -126,11 +135,17 @@ export function SecuritySettings({ factors, email }: { factors: { id: string; na
       </Card>
 
       <Card>
-        <CardHeader title="Sessions" description="Déconnectez les appareils que vous n'utilisez plus." icon={<Laptop className="h-4 w-4" />} />
+        <CardHeader title="Sessions" description="Verrouillez cet appareil ou déconnectez ceux que vous n'utilisez plus." icon={<Laptop className="h-4 w-4" />} />
         <div className="flex flex-col gap-3 p-5 sm:flex-row">
+          <Button variant="outline" loading={locking} onClick={() => startLocking(() => { void lockSpaceNow(); })}>
+            <Lock className="h-4 w-4" /> Verrouiller maintenant
+          </Button>
           <Button variant="outline" loading={busy === "others"} onClick={signOutOthers}><LogOut className="h-4 w-4" /> Déconnecter les autres appareils</Button>
-          <Button variant="ghost" onClick={async () => { await createClient().auth.signOut(); window.location.href = "/connexion"; }}>Me déconnecter ici</Button>
+          <Button variant="ghost" onClick={() => { void logout(); }}>Me déconnecter ici</Button>
         </div>
+        <p className="px-5 pb-5 text-xs text-subtle">
+          Verrouiller ne ferme pas la session : votre code suffit pour revenir dans votre espace.
+        </p>
       </Card>
     </div>
   );

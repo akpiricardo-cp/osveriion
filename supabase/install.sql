@@ -3553,66 +3553,1672 @@ grant execute on function public.claim_push_batch(int), public.claim_email_batch
 grant select, insert, update, delete on public.notifications, public.notification_preferences, public.push_subscriptions to service_role;
 grant select on public.profiles to service_role;
 
+-- >>>>>>>>>> supabase/migrations/20260928000008_access_code.sql
+-- =============================================================================
+-- VERIION OS — Migration 8 : code d'accès personnel
+-- =============================================================================
+-- Remplace la double authentification TOTP (application d'authentification) par
+-- un code personnel choisi par le collaborateur :
+--   * il le définit lui-même, une fois, et le change quand il veut ;
+--   * il le saisit à chaque nouvelle session pour rouvrir son espace — la
+--     session Supabase n'est jamais fermée, l'application est simplement
+--     verrouillée jusqu'à la saisie du code ;
+--   * seul un hachage bcrypt est conservé. La table n'est lisible par personne,
+--     pas même son propriétaire : tout passe par les fonctions ci-dessous.
+-- =============================================================================
+
+create table public.access_codes (
+  profile_id     uuid primary key references public.profiles(id) on delete cascade,
+  code_hash      text        not null,
+  attempts       int         not null default 0,   -- échecs consécutifs depuis le dernier succès
+  locked_until   timestamptz,                      -- blocage temporaire après trop d'échecs
+  last_unlock_at timestamptz,                      -- dernier déverrouillage réussi
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now()
+);
+-- RLS active et volontairement sans aucune policy ni grant : la table est
+-- inaccessible depuis l'API, les fonctions security definer en sont la seule porte.
+alter table public.access_codes enable row level security;
+
+create trigger access_codes_touch before update on public.access_codes
+  for each row execute function public.set_updated_at();
+-- Audit sans le contenu des lignes (« redact ») : on trace la création et la
+-- suppression d'un code, jamais son hachage ni les tentatives.
+create trigger audit_access_codes after insert or delete on public.access_codes
+  for each row execute function public.audit_trigger('redact');
+
+-- -----------------------------------------------------------------------------
+-- Forme acceptée : 6 à 32 caractères, sans espace, ni caractère répété
+-- (000000), ni suite de chiffres évidente (123456, 654321).
+-- -----------------------------------------------------------------------------
+create or replace function public.access_code_valid(p_code text)
+returns boolean language plpgsql immutable as $$
+declare n int; i int; ascending boolean; descending boolean;
+begin
+  if p_code is null then return false; end if;
+  n := length(p_code);
+  if n < 6 or n > 32 then return false; end if;
+  if p_code ~ '\s' then return false; end if;
+  if p_code ~ '^(.)\1*$' then return false; end if;
+  if p_code ~ '^\d+$' then
+    ascending := true; descending := true;
+    for i in 2..n loop
+      if ascii(substr(p_code, i, 1)) <> ascii(substr(p_code, i - 1, 1)) + 1 then ascending := false; end if;
+      if ascii(substr(p_code, i, 1)) <> ascii(substr(p_code, i - 1, 1)) - 1 then descending := false; end if;
+    end loop;
+    if ascending or descending then return false; end if;
+  end if;
+  return true;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- Un code est-il défini ? (pour soi, ou pour un collaborateur si l'on administre)
+-- -----------------------------------------------------------------------------
+create or replace function public.has_access_code(p_profile uuid default null)
+returns boolean language plpgsql stable security definer set search_path = public as $$
+declare target uuid := coalesce(p_profile, auth.uid());
+begin
+  if target is null then return false; end if;
+  if target <> auth.uid() and not public.has_perm('users.admin') then
+    raise exception 'Permission refusée' using errcode = '42501';
+  end if;
+  return exists (select 1 from public.access_codes where profile_id = target);
+end $$;
+grant execute on function public.has_access_code(uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Vérifier son code pour rouvrir son espace.
+-- Retourne { ok:true } ou { ok:false, remaining } / { ok:false, locked_until } /
+-- { ok:false, missing:true } si aucun code n'est encore défini.
+-- 5 échecs consécutifs bloquent la saisie pendant 15 minutes.
+-- -----------------------------------------------------------------------------
+create or replace function public.verify_access_code(p_code text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  rec          public.access_codes;
+  max_attempts constant int      := 5;
+  lock_delay   constant interval := interval '15 minutes';
+  until_ts     timestamptz;
+  remaining    int;
+begin
+  if auth.uid() is null then raise exception 'Non connecté' using errcode = '42501'; end if;
+  select * into rec from public.access_codes where profile_id = auth.uid() for update;
+  if rec.profile_id is null then return jsonb_build_object('ok', false, 'missing', true); end if;
+  if rec.locked_until is not null and rec.locked_until > now() then
+    return jsonb_build_object('ok', false, 'remaining', 0, 'locked_until', rec.locked_until);
+  end if;
+  if p_code is not null and rec.code_hash = extensions.crypt(p_code, rec.code_hash) then
+    update public.access_codes set attempts = 0, locked_until = null, last_unlock_at = now()
+     where profile_id = auth.uid();
+    return jsonb_build_object('ok', true);
+  end if;
+  if rec.attempts + 1 >= max_attempts then
+    update public.access_codes set attempts = 0, locked_until = now() + lock_delay
+     where profile_id = auth.uid() returning locked_until into until_ts;
+    return jsonb_build_object('ok', false, 'remaining', 0, 'locked_until', until_ts);
+  end if;
+  update public.access_codes set attempts = rec.attempts + 1
+   where profile_id = auth.uid() returning max_attempts - attempts into remaining;
+  return jsonb_build_object('ok', false, 'remaining', remaining);
+end $$;
+grant execute on function public.verify_access_code(text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Définir ou changer son code. Le changement exige le code actuel, vérifié par
+-- `verify_access_code` : le changement de code est donc soumis au même compteur
+-- d'échecs et au même blocage temporaire que le déverrouillage.
+-- -----------------------------------------------------------------------------
+create or replace function public.set_access_code(p_code text, p_current text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare existing public.access_codes; verdict jsonb;
+begin
+  if auth.uid() is null then raise exception 'Non connecté' using errcode = '42501'; end if;
+  if not public.is_active_user() then raise exception 'Compte inactif' using errcode = '42501'; end if;
+  if not public.access_code_valid(p_code) then
+    raise exception 'Le code doit contenir de 6 à 32 caractères, sans espace, et ne pas être un caractère répété ni une suite évidente.';
+  end if;
+  select * into existing from public.access_codes where profile_id = auth.uid();
+  if existing.profile_id is not null then
+    verdict := public.verify_access_code(p_current);
+    if not coalesce((verdict->>'ok')::boolean, false) then
+      if verdict ? 'locked_until' then
+        raise exception 'Trop de tentatives. Réessayez dans quelques minutes ou demandez une réinitialisation à l''administration.' using errcode = '42501';
+      end if;
+      raise exception 'Code actuel incorrect.' using errcode = '42501';
+    end if;
+    update public.access_codes
+       set code_hash = extensions.crypt(p_code, extensions.gen_salt('bf', 10)),
+           attempts = 0, locked_until = null, last_unlock_at = now()
+     where profile_id = auth.uid();
+  else
+    insert into public.access_codes (profile_id, code_hash, last_unlock_at)
+    values (auth.uid(), extensions.crypt(p_code, extensions.gen_salt('bf', 10)), now());
+  end if;
+end $$;
+grant execute on function public.set_access_code(text, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Code oublié : un administrateur l'efface, la personne en redéfinit un à sa
+-- prochaine ouverture. L'opération est journalisée (audit).
+-- -----------------------------------------------------------------------------
+create or replace function public.clear_access_code(p_profile uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.has_perm('users.admin') then
+    raise exception 'Action réservée aux administrateurs' using errcode = '42501';
+  end if;
+  delete from public.access_codes where profile_id = p_profile;
+end $$;
+grant execute on function public.clear_access_code(uuid) to authenticated;
+
+-- Un départ efface le code d'accès : plus rien ne subsiste de l'accès personnel.
+create or replace function public.access_codes_drop_on_offboard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  delete from public.access_codes where profile_id = new.id;
+  return null;
+end $$;
+create trigger profiles_drop_access_code after update of status on public.profiles
+  for each row when (new.status = 'offboarded' and old.status <> 'offboarded')
+  execute function public.access_codes_drop_on_offboard();
+
+-- >>>>>>>>>> supabase/migrations/20260929000009_holding.sql
+-- =============================================================================
+-- VERIION OS — Migration 9 : la holding et ses projets
+-- =============================================================================
+-- VERIION est une holding qui pilote plusieurs projets tech. Deux axes se
+-- croisent, et c'est ce croisement que cette migration installe :
+--
+--   * l'axe administratif — les départements transverses de la holding
+--     (Direction Générale, Opérations, Technologie, Finance, Business,
+--     Marketing, Juridique, Ressources Humaines), chacun dirigé par un officier
+--     dont l'intitulé est porté par l'unité (CEO, COO, CTO, CFO, CBO, CMO…) ;
+--
+--   * l'axe produit — les projets, chacun dirigé par un Chief Product et son
+--     équipe.
+--
+-- Le lien entre les deux : chaque département désigne un **référent** par
+-- projet. C'est le point de contact direct du chef de projet pour cette
+-- fonction. Le référent rejoint automatiquement le canal du projet : la
+-- coordination se fait de personne à personne, pas de service à service.
+--
+-- Cette migration apporte aussi :
+--   * l'intitulé de poste calculé à la nomination (plus de saisie libre) ;
+--   * la fusion de deux unités, pour que le CEO puisse réduire ou regrouper
+--     des départements sans perdre l'historique ;
+--   * le profil obligatoire : une fiche incomplète ne donne pas accès à l'outil.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Domaines métier : ouverture au juridique et au produit
+-- -----------------------------------------------------------------------------
+-- Le domaine reste la clé des droits automatiques (role_templates). Il devient
+-- du texte contraint plutôt qu'un type énuméré : ajouter un domaine ne demande
+-- plus de migration lourde, et la liste reste vérifiée par la base.
+-- Le trigger de resynchronisation des droits cite la colonne (« update of domain ») :
+-- PostgreSQL refuse d'en changer le type tant qu'il existe. On le repose juste apres.
+drop trigger if exists org_units_domain_au on public.org_units;
+
+alter table public.org_units      alter column domain type text using domain::text;
+alter table public.role_templates alter column domain type text using domain::text;
+drop type if exists public.unit_domain;
+
+drop trigger if exists org_units_domain_au on public.org_units;
+create trigger org_units_domain_au after update of domain, archived_at on public.org_units
+  for each row execute function public.org_units_after_domain_change();
+
+create table if not exists public.unit_domains (
+  key         text primary key,
+  label       text not null,
+  description text,
+  sort_order  int  not null default 0
+);
+insert into public.unit_domains (key, label, description, sort_order) values
+  ('direction',  'Direction',     'Vision, arbitrages et pilotage de la holding',          1),
+  ('operations', 'Opérations',    'Calendrier opérationnel, exécution et qualité',          2),
+  ('technology', 'Technologie',   'Plateformes, infrastructure et sécurité',                3),
+  ('product',    'Produit',       'Conception et pilotage des produits',                    4),
+  ('marketing',  'Marketing',     'Acquisition, communication et contenu',                  5),
+  ('business',   'Business',      'Ventes, partenariats et développement',                  6),
+  ('finance',    'Finance',       'Comptabilité, trésorerie et contrôle',                   7),
+  ('legal',      'Juridique',     'Contrats, conformité et contentieux',                    8),
+  ('hr',         'Ressources humaines', 'Recrutement, contrats de travail, paie',           9),
+  ('other',      'Autre',         'Fonction transverse ou support',                        99);
+
+alter table public.org_units drop constraint if exists org_units_domain_fk;
+alter table public.org_units add constraint org_units_domain_fk foreign key (domain) references public.unit_domains(key) on update cascade;
+alter table public.role_templates drop constraint if exists role_templates_domain_fk;
+alter table public.role_templates add constraint role_templates_domain_fk foreign key (domain) references public.unit_domains(key) on update cascade;
+
+grant select, insert, update, delete on public.unit_domains to authenticated;
+alter table public.unit_domains enable row level security;
+drop policy if exists "domaines: lecture" on public.unit_domains;
+create policy "domaines: lecture" on public.unit_domains for select to authenticated using (public.is_active_user());
+drop policy if exists "domaines: gestion" on public.unit_domains;
+create policy "domaines: gestion" on public.unit_domains for all to authenticated
+  using (public.is_ceo()) with check (public.is_ceo());
+
+-- -----------------------------------------------------------------------------
+-- 2. L'unité porte les intitulés de poste
+-- -----------------------------------------------------------------------------
+-- Nommer quelqu'un responsable d'un département lui donne le titre du poste :
+-- personne ne saisit plus « CFO » à la main, et un changement de titre suit
+-- automatiquement la personne en poste.
+alter table public.org_units
+  add column if not exists head_title   text,   -- ex. « CFO — Directeur Financier »
+  add column if not exists deputy_title text,
+  add column if not exists member_title text,
+  add column if not exists is_core      boolean not null default false;  -- département fondateur de la holding
+
+comment on column public.org_units.head_title is 'Intitulé attribué automatiquement au responsable de l''unité.';
+comment on column public.org_units.is_core    is 'Département structurant de la holding : signalé dans l''organigramme, fusion déconseillée.';
+
+-- Intitulé attendu pour un rôle dans une unité (utilisé à la nomination).
+create or replace function public.job_title_for(p_unit uuid, p_role public.membership_role)
+returns text language sql stable security definer set search_path = public as $$
+  select case p_role
+    when 'head' then coalesce(u.head_title, case u.kind
+        when 'company'       then 'CEO'
+        when 'department'    then 'Directeur — ' || u.name
+        when 'subdepartment' then 'Responsable — ' || u.name
+        else 'Chef d''équipe — ' || u.name end)
+    when 'deputy' then coalesce(u.deputy_title, case u.kind
+        when 'company'       then 'Directeur Général Adjoint'
+        when 'department'    then 'Directeur adjoint — ' || u.name
+        else 'Adjoint — ' || u.name end)
+    else u.member_title
+  end
+  from public.org_units u where u.id = p_unit
+$$;
+grant execute on function public.job_title_for(uuid, public.membership_role) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 3. Projets : des produits de la holding, dirigés par un Chief Product
+-- -----------------------------------------------------------------------------
+alter table public.projects
+  add column if not exists lead_id uuid references public.profiles(id) on delete set null,
+  add column if not exists mission text;
+comment on column public.projects.lead_id is 'Chief Product : dirige le projet, son équipe et la répartition des tâches.';
+
+update public.projects set lead_id = owner_id where lead_id is null;
+create index if not exists projects_lead_idx on public.projects(lead_id);
+
+-- Référent d'un département pour un projet : le point de contact direct du
+-- chef de projet pour cette fonction (opérations, finance, juridique…).
+create table if not exists public.project_liaisons (
+  project_id  uuid not null references public.projects(id)  on delete cascade,
+  unit_id     uuid not null references public.org_units(id) on delete cascade,
+  profile_id  uuid not null references public.profiles(id)  on delete cascade,
+  note        text,
+  created_by  uuid references public.profiles(id) on delete set null default auth.uid(),
+  created_at  timestamptz not null default now(),
+  primary key (project_id, unit_id)
+);
+create index if not exists project_liaisons_profile_idx on public.project_liaisons(profile_id);
+create index if not exists project_liaisons_unit_idx    on public.project_liaisons(unit_id);
+
+-- Le chef de projet dirige ; le référent d'un département voit le projet et
+-- échange dans son canal, sans pouvoir répartir les tâches de l'équipe.
+create or replace function public.is_project_lead(p_project uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.projects p
+    where p.id = p_project and (p.lead_id = auth.uid() or p.owner_id = auth.uid())
+  ) or coalesce(public.project_role(p_project) = 'lead', false)
+$$;
+grant execute on function public.is_project_lead(uuid) to authenticated;
+
+create or replace function public.is_project_liaison(p_project uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.project_liaisons l
+    where l.project_id = p_project
+      and (l.profile_id = auth.uid() or public.has_perm('unit.manage', l.unit_id))
+  )
+$$;
+grant execute on function public.is_project_liaison(uuid) to authenticated;
+
+create or replace function public.can_manage_project(p_project uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.projects p
+    where p.id = p_project and (
+      p.owner_id = auth.uid() or p.lead_id = auth.uid()
+      or public.project_role(p.id) = 'lead'
+      or public.has_perm('projects.admin')
+      or public.has_perm('unit.manage', p.unit_id)
+    )
+  )
+$$;
+
+create or replace function public.can_view_project(p_project uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.projects p
+    where p.id = p_project and (
+      public.project_role(p.id) is not null
+      or p.owner_id = auth.uid() or p.lead_id = auth.uid()
+      or public.in_unit(p.unit_id)
+      or public.has_perm('projects.admin')
+      or public.has_perm('unit.manage', p.unit_id)
+      or public.has_perm('dashboard.exec')
+    )
+  ) or public.is_project_liaison(p_project)
+$$;
+
+alter table public.project_liaisons enable row level security;
+grant select, insert, update, delete on public.project_liaisons to authenticated;
+drop policy if exists "référents: lecture" on public.project_liaisons;
+create policy "référents: lecture" on public.project_liaisons for select to authenticated
+  using (public.is_active_user() and (public.can_view_project(project_id) or public.can_view_unit(unit_id)));
+drop policy if exists "référents: désignation" on public.project_liaisons;
+create policy "référents: désignation" on public.project_liaisons for all to authenticated
+  using (public.has_perm('org.manage') or public.has_perm('unit.manage', unit_id))
+  with check (public.has_perm('org.manage') or public.has_perm('unit.manage', unit_id));
+
+-- Désigner un référent l'ajoute au canal du projet et le prévient : la
+-- coordination démarre dans la foulée, sans démarche supplémentaire.
+create or replace function public.project_liaisons_after_write()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_channel uuid; v_project text; v_unit text;
+begin
+  select name into v_project from public.projects  where id = new.project_id;
+  select name into v_unit    from public.org_units where id = new.unit_id;
+  select id into v_channel from public.channels where project_id = new.project_id and kind = 'project' limit 1;
+  if v_channel is not null then
+    insert into public.channel_members (channel_id, profile_id) values (v_channel, new.profile_id)
+    on conflict do nothing;
+  end if;
+  perform public.notify(new.profile_id, 'project.liaison',
+    'Référent ' || coalesce(v_unit, 'département') || ' — ' || coalesce(v_project, 'projet'),
+    'Vous coordonnez ce projet pour votre département.', '/projets/' || new.project_id);
+  perform public.notify(p.lead_id, 'project.liaison',
+    coalesce(v_unit, 'Un département') || ' a désigné un référent',
+    'Votre point de contact pour ce département est à jour.', '/projets/' || new.project_id)
+    from public.projects p where p.id = new.project_id and p.lead_id is distinct from new.profile_id;
+  return null;
+end $$;
+drop trigger if exists project_liaisons_aiu on public.project_liaisons;
+create trigger project_liaisons_aiu after insert or update on public.project_liaisons
+  for each row execute function public.project_liaisons_after_write();
+
+-- Le chef de projet est membre de son projet, et le reste s'il change.
+create or replace function public.projects_sync_lead()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.lead_id is not null then
+    insert into public.project_members (project_id, profile_id, role) values (new.id, new.lead_id, 'lead')
+    on conflict (project_id, profile_id) do update set role = 'lead';
+    if tg_op = 'UPDATE' and old.lead_id is distinct from new.lead_id then
+      update public.project_members set role = 'member'
+       where project_id = new.id and profile_id = old.lead_id;
+      perform public.notify(new.lead_id, 'project.lead', 'Vous dirigez « ' || new.name || ' »',
+        'Le pilotage de ce projet vous est confié.', '/projets/' || new.id);
+    end if;
+    perform public.refresh_job_title(new.lead_id);
+  end if;
+  if tg_op = 'UPDATE' and old.lead_id is not null and old.lead_id is distinct from new.lead_id then
+    perform public.refresh_job_title(old.lead_id);
+  end if;
+  return null;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- 4. L'intitulé de poste suit les nominations
+-- -----------------------------------------------------------------------------
+-- Règle : le poste le plus élevé l'emporte (responsable avant adjoint, unité la
+-- plus haute avant une équipe), puis la direction d'un projet, puis l'intitulé
+-- de membre défini par l'unité.
+create or replace function public.refresh_job_title(p_profile uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_title text;
+begin
+  select public.job_title_for(m.unit_id, m.role) into v_title
+  from public.unit_memberships m
+  join public.org_units u on u.id = m.unit_id and u.archived_at is null
+  where m.profile_id = p_profile and m.end_date is null
+    and public.job_title_for(m.unit_id, m.role) is not null
+  order by public.membership_rank(m.role) desc, u.depth asc, m.start_date asc
+  limit 1;
+
+  if v_title is null then
+    select 'Chief Product — ' || p.name into v_title
+    from public.projects p
+    where p.lead_id = p_profile and p.archived_at is null
+    order by p.created_at asc limit 1;
+  end if;
+
+  if v_title is not null then
+    update public.profiles set job_title = v_title where id = p_profile and job_title is distinct from v_title;
+  end if;
+end $$;
+grant execute on function public.refresh_job_title(uuid) to authenticated;
+
+drop trigger if exists projects_lead_aiu on public.projects;
+create trigger projects_lead_aiu after insert or update of lead_id on public.projects
+  for each row execute function public.projects_sync_lead();
+
+-- Le passage par les appartenances reste le seul chemin : on étend le trigger
+-- existant pour qu'il rafraîchisse aussi l'intitulé.
+create or replace function public.unit_memberships_after_change()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op in ('UPDATE', 'DELETE') then
+    perform public.sync_auto_grants(old.profile_id);
+    perform public.refresh_job_title(old.profile_id);
+  end if;
+  if tg_op in ('INSERT', 'UPDATE') then
+    perform public.sync_auto_grants(new.profile_id);
+    update public.profiles set primary_unit_id = new.unit_id
+      where id = new.profile_id and primary_unit_id is null and new.end_date is null;
+    perform public.refresh_job_title(new.profile_id);
+  end if;
+  return null;
+end $$;
+
+-- Nomination : l'intitulé est calculé, sauf titre explicite (rare, et tracé).
+create or replace function public.appoint_member(
+  p_unit uuid, p_profile uuid, p_role public.membership_role,
+  p_title text default null, p_start date default current_date
+) returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  v_parent uuid;
+  v_id uuid;
+  v_title text;
+begin
+  select parent_id into v_parent from public.org_units where id = p_unit and archived_at is null;
+  if not found then raise exception 'Unité introuvable ou archivée'; end if;
+
+  -- Nommer un responsable : org.manage ou gestion de l'unité parente. Membres/adjoints : gestion de l'unité.
+  if not (public.has_perm('org.manage')
+          or (p_role = 'head' and v_parent is not null and public.has_perm('unit.manage', v_parent))
+          or (p_role <> 'head' and public.has_perm('unit.manage', p_unit))) then
+    raise exception 'Permission refusée' using errcode = '42501';
+  end if;
+
+  v_title := coalesce(nullif(trim(coalesce(p_title, '')), ''), public.job_title_for(p_unit, p_role));
+
+  if p_role = 'head' then
+    update public.unit_memberships
+       set end_date = greatest(start_date, p_start - 1)
+     where unit_id = p_unit and role = 'head' and end_date is null and profile_id <> p_profile;
+  end if;
+
+  update public.unit_memberships
+     set end_date = greatest(start_date, p_start - 1)
+   where unit_id = p_unit and profile_id = p_profile and end_date is null;
+
+  insert into public.unit_memberships (unit_id, profile_id, role, title, start_date, created_by)
+  values (p_unit, p_profile, p_role, v_title, p_start, auth.uid())
+  returning id into v_id;
+  return v_id;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- 5. Fusionner deux unités (le CEO réduit ou regroupe son organisation)
+-- -----------------------------------------------------------------------------
+-- Tout ce qui pendait à l'unité absorbée bascule sur l'unité d'accueil :
+-- personnes, sous-unités, canaux, budgets, projets, annonces, objectifs,
+-- dossiers. L'unité absorbée est archivée, jamais supprimée : l'historique des
+-- nominations et le journal d'audit restent lisibles.
+create or replace function public.merge_org_units(p_source uuid, p_target uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  s public.org_units;
+  t public.org_units;
+  m record;
+  v_role public.membership_role;
+  v_src_root uuid;
+  v_tgt_root uuid;
+begin
+  if not public.has_perm('org.manage') then
+    raise exception 'Seule la direction peut fusionner des unités' using errcode = '42501';
+  end if;
+  if p_source = p_target then raise exception 'Choisissez deux unités différentes'; end if;
+  select * into s from public.org_units where id = p_source;
+  select * into t from public.org_units where id = p_target;
+  if s.id is null or t.id is null then raise exception 'Unité introuvable'; end if;
+  if s.parent_id is null then raise exception 'L''entreprise elle-même ne peut pas être fusionnée'; end if;
+  if s.id = any(t.path) then raise exception 'L''unité d''accueil dépend de l''unité à fusionner : choisissez l''autre sens'; end if;
+
+  -- Les personnes suivent, en conservant leur rang quand la place est libre.
+  for m in select * from public.unit_memberships where unit_id = p_source and end_date is null loop
+    v_role := m.role;
+    if v_role = 'head' and exists (
+      select 1 from public.unit_memberships where unit_id = p_target and role = 'head' and end_date is null
+    ) then
+      v_role := 'deputy';
+    end if;
+    if exists (select 1 from public.unit_memberships where unit_id = p_target and profile_id = m.profile_id and end_date is null) then
+      update public.unit_memberships set end_date = current_date where id = m.id;
+    else
+      update public.unit_memberships
+         set unit_id = p_target, role = v_role, title = public.job_title_for(p_target, v_role)
+       where id = m.id;
+    end if;
+  end loop;
+
+  update public.org_units    set parent_id = p_target where parent_id = p_source;
+  update public.channels     set unit_id   = p_target where unit_id = p_source;
+  update public.projects     set unit_id   = p_target where unit_id = p_source;
+  update public.announcements set unit_id  = p_target where unit_id = p_source;
+  update public.objectives   set unit_id   = p_target where unit_id = p_source;
+  update public.invoices     set unit_id   = p_target where unit_id = p_source;
+  update public.transactions set unit_id   = p_target where unit_id = p_source;
+  update public.project_liaisons l set unit_id = p_target where unit_id = p_source
+     and not exists (select 1 from public.project_liaisons x where x.project_id = l.project_id and x.unit_id = p_target);
+  delete from public.project_liaisons where unit_id = p_source;
+
+  -- Les budgets se cumulent sur l'exercice, plutôt que de se perdre.
+  update public.budgets b set amount = b.amount + s2.amount
+    from public.budgets s2
+   where b.unit_id = p_target and s2.unit_id = p_source and s2.fiscal_year = b.fiscal_year;
+  update public.budgets set unit_id = p_target
+   where unit_id = p_source and fiscal_year not in (select fiscal_year from public.budgets where unit_id = p_target);
+  delete from public.budgets where unit_id = p_source;
+
+  -- Drive : l'espace de l'unité absorbée se déverse dans celui de l'unité d'accueil,
+  -- en suffixant les dossiers dont le nom existe déjà des deux côtés.
+  select id into v_src_root from public.folders where is_root and space = 'unit' and unit_id = p_source;
+  select id into v_tgt_root from public.folders where is_root and space = 'unit' and unit_id = p_target;
+  if v_src_root is not null and v_tgt_root is not null then
+    for m in select * from public.folders where parent_id = v_src_root and deleted_at is null loop
+      if exists (select 1 from public.folders f
+                  where f.parent_id = v_tgt_root and lower(f.name) = lower(m.name) and f.deleted_at is null) then
+        update public.folders set parent_id = v_tgt_root, name = m.name || ' (' || s.name || ')' where id = m.id;
+      else
+        update public.folders set parent_id = v_tgt_root where id = m.id;
+      end if;
+    end loop;
+    update public.documents set folder_id = v_tgt_root where folder_id = v_src_root;
+    update public.folders set unit_id = p_target where unit_id = p_source and not is_root;
+    update public.folders set deleted_at = now() where id = v_src_root;
+  end if;
+
+  update public.profiles set primary_unit_id = p_target where primary_unit_id = p_source;
+  update public.org_units set archived_at = now() where id = p_source;
+end $$;
+grant execute on function public.merge_org_units(uuid, uuid) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 6. Profil obligatoire
+-- -----------------------------------------------------------------------------
+-- Un annuaire ne vaut que si les fiches sont remplies : tant que la sienne ne
+-- l'est pas, l'application reste fermée (contrôle côté interface, la donnée
+-- restant vérifiée ici).
+alter table public.profiles add column if not exists profile_completed_at timestamptz;
+
+create or replace function public.profile_fields_complete(p public.profiles)
+returns boolean language sql immutable as $$
+  select length(trim(coalesce(p.first_name, ''))) > 1
+     and length(trim(coalesce(p.last_name,  ''))) > 1
+     and length(trim(coalesce(p.phone,      ''))) > 5
+     and length(trim(coalesce(p.location,   ''))) > 1
+$$;
+
+create or replace function public.profiles_track_completion()
+returns trigger language plpgsql as $$
+begin
+  if public.profile_fields_complete(new) then
+    new.profile_completed_at := coalesce(new.profile_completed_at, now());
+  else
+    new.profile_completed_at := null;
+  end if;
+  return new;
+end $$;
+drop trigger if exists profiles_completion_biu on public.profiles;
+create trigger profiles_completion_biu before insert or update on public.profiles
+  for each row execute function public.profiles_track_completion();
+
+update public.profiles set updated_at = updated_at;  -- réévalue les fiches existantes
+
+-- -----------------------------------------------------------------------------
+-- 7. La holding : départements structurants et intitulés des officiers
+-- -----------------------------------------------------------------------------
+do $$
+declare root uuid; v_id uuid;
+begin
+  select id into root from public.org_units where parent_id is null order by created_at limit 1;
+  if root is null then return; end if;   -- base neuve : seed.sql pose la structure
+
+  update public.org_units set head_title = 'CEO — Directeur Général', is_core = true, domain = 'direction'
+   where id = root;
+
+  -- Intitulés des officiers, sur les départements déjà en place
+  update public.org_units set head_title = 'CEO — Directeur Général',        deputy_title = 'Directeur Général Adjoint',  is_core = true where code = 'DG';
+  update public.org_units set head_title = 'COO — Directeur des Opérations', deputy_title = 'Responsable des Opérations', is_core = true where code = 'OPS';
+  update public.org_units set head_title = 'CTO — Directeur Technique',      deputy_title = 'Responsable Technique',      is_core = true where code = 'TECH';
+  update public.org_units set head_title = 'CFO — Directeur Financier',      deputy_title = 'Responsable Financier',      is_core = true where code = 'FIN';
+  update public.org_units set head_title = 'CBO — Directeur Business',       deputy_title = 'Responsable Business',       is_core = true where code = 'BIZ';
+  update public.org_units set head_title = 'CMO — Directeur Marketing',      deputy_title = 'Responsable Marketing',      is_core = true where code = 'MKT';
+
+  -- Départements manquants de la holding
+  if not exists (select 1 from public.org_units where code = 'LEG') then
+    insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, is_core)
+    values (root, 'Juridique', 'LEG', 'department', 'legal', '#7C3AED', 7,
+            'Contrats, conformité, propriété intellectuelle et contentieux',
+            'Directeur Juridique', 'Juriste principal', true);
+  end if;
+  if not exists (select 1 from public.org_units where code = 'RH') then
+    insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, is_core)
+    values (root, 'Ressources Humaines', 'RH', 'department', 'hr', '#0D9488', 8,
+            'Recrutement, contrats de travail, paie et parcours des collaborateurs',
+            'CHRO — Directeur des Ressources Humaines', 'Responsable RH', true);
+  end if;
+
+  -- Intitulés par défaut des niveaux inférieurs
+  update public.org_units set member_title = null where member_title = '';
+end $$;
+
+-- Droits automatiques des deux nouveaux domaines.
+insert into public.role_templates (domain, membership_role, permission, scoped) values
+  ('legal', 'head',   'docs.confidential', false),
+  ('legal', 'head',   'dashboard.exec',    false),
+  ('hr',    'head',   'hr.admin',          false),
+  ('hr',    'head',   'dashboard.exec',    false),
+  ('hr',    'member', 'hr.view',           false)
+on conflict do nothing;
+
+-- Recalcule droits et intitulés pour tout le monde (les modèles ont changé).
+do $$ declare r record; begin
+  for r in select id from public.profiles where status = 'active' loop
+    perform public.sync_auto_grants(r.id);
+    perform public.refresh_job_title(r.id);
+  end loop;
+end $$;
+
+-- >>>>>>>>>> supabase/migrations/20260930000010_operations_legal.sql
+-- =============================================================================
+-- VERIION OS — Migration 10 : opérations, juridique, validations et tâches
+-- =============================================================================
+-- Comment le travail descend et remonte dans la holding :
+--
+--   1. Les Opérations écrivent le calendrier d'un projet (mensuel, hebdomadaire,
+--      journalier) sous forme de grandes lignes.
+--   2. Le calendrier mensuel est soumis au CEO, puis publié au chef de projet.
+--   3. Le chef de projet découpe chaque grande ligne en tâches et les répartit
+--      dans son équipe — lui compris. Personne n'assigne vers le haut ni en
+--      dehors de son périmètre.
+--   4. Chaque membre soumet sa tâche terminée à vérification ; celui qui l'a
+--      assignée valide ou renvoie avec un motif.
+--   5. Le chef de projet rend compte aux Opérations pour chaque cycle.
+--
+-- En parallèle : le registre juridique (contrats, échéances, renouvellements) et
+-- le guichet unique des validations du CEO (budgets et dépenses au-delà d'un
+-- seuil, contrats, calendriers mensuels, lancement de projet et embauches).
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Validations : le guichet unique des décisions du CEO
+-- -----------------------------------------------------------------------------
+do $enum$ begin
+  create type public.approval_kind as enum ('budget', 'expense', 'legal_contract', 'operation_cycle', 'project', 'employment_contract', 'other');
+exception when duplicate_object then null;
+end $enum$;
+do $enum$ begin
+  create type public.approval_status as enum ('pending', 'approved', 'rejected', 'cancelled');
+exception when duplicate_object then null;
+end $enum$;
+
+-- Seuil au-delà duquel une dépense ou un budget remonte au CEO.
+alter table public.company_settings
+  add column if not exists ceo_approval_threshold numeric(16,2) not null default 500000;
+
+create table if not exists public.approval_requests (
+  id             uuid primary key default gen_random_uuid(),
+  kind           public.approval_kind not null,
+  subject_id     uuid,                       -- la ligne concernée (budget, contrat, cycle…)
+  subject_label  text not null,
+  amount         numeric(16,2),
+  currency       text not null default 'XOF',
+  justification  text,
+  unit_id        uuid references public.org_units(id) on delete set null,
+  project_id     uuid references public.projects(id)  on delete set null,
+  status         public.approval_status not null default 'pending',
+  requested_by   uuid references public.profiles(id) on delete set null default auth.uid(),
+  decided_by     uuid references public.profiles(id) on delete set null,
+  decided_at     timestamptz,
+  decision_note  text,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now()
+);
+-- Une seule demande en attente par sujet : pas de double file.
+create unique index if not exists approval_requests_pending_subject on public.approval_requests(kind, subject_id)
+  where status = 'pending' and subject_id is not null;
+create index if not exists approval_requests_queue_idx on public.approval_requests(status, created_at desc);
+create index if not exists approval_requests_author_idx on public.approval_requests(requested_by, created_at desc);
+drop trigger if exists approval_requests_updated_at on public.approval_requests;
+create trigger approval_requests_updated_at before update on public.approval_requests
+  for each row execute function public.set_updated_at();
+drop trigger if exists audit_approval_requests on public.approval_requests;
+create trigger audit_approval_requests after insert or update or delete on public.approval_requests
+  for each row execute function public.audit_trigger();
+
+insert into public.permissions (key, label, description, category, scopable) values
+  ('approvals.decide', 'Valider les décisions', 'Approuver budgets, dépenses, contrats, calendriers et lancements de projet', 'Direction', false),
+  ('ops.plan',         'Planifier les opérations', 'Écrire et publier le calendrier opérationnel des projets',                 'Opérations', false),
+  ('ops.review',       'Suivre les rapports',      'Lire les rapports des chefs de projet et en accuser réception',           'Opérations', false),
+  ('legal.view',       'Consulter le juridique',   'Lecture du registre des contrats et de leurs échéances',                  'Juridique',  false),
+  ('legal.admin',      'Administrer le juridique', 'Rédiger, réviser, signer et clôturer les contrats',                       'Juridique',  false)
+on conflict (key) do nothing;
+
+insert into public.role_templates (domain, membership_role, permission, scoped) values
+  ('operations', 'head',   'ops.plan',   false),
+  ('operations', 'deputy', 'ops.plan',   false),
+  ('operations', 'member', 'ops.review', false),
+  ('operations', 'head',   'ops.review', false),
+  ('legal',      'head',   'legal.admin', false),
+  ('legal',      'deputy', 'legal.admin', false),
+  ('legal',      'member', 'legal.view',  false),
+  ('finance',    'head',   'legal.view',  false)
+on conflict do nothing;
+
+-- Le CEO décide ; il peut déléguer par une dérogation « approvals.decide ».
+create or replace function public.can_decide_approvals()
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_ceo() or public.has_perm('approvals.decide')
+$$;
+grant execute on function public.can_decide_approvals() to authenticated;
+
+create or replace function public.ceo_approval_threshold()
+returns numeric language sql stable security definer set search_path = public as $$
+  select coalesce((select ceo_approval_threshold from public.company_settings where id), 500000)
+$$;
+grant execute on function public.ceo_approval_threshold() to authenticated;
+
+/** Une décision approuvée existe-t-elle pour ce sujet ? */
+create or replace function public.approval_granted(p_kind public.approval_kind, p_subject uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.approval_requests
+    where kind = p_kind and subject_id = p_subject and status = 'approved'
+  )
+$$;
+grant execute on function public.approval_granted(public.approval_kind, uuid) to authenticated;
+
+/** Soumet une décision au CEO. Renvoie la demande déjà en attente s'il y en a une. */
+create or replace function public.request_approval(
+  p_kind public.approval_kind, p_subject uuid, p_label text,
+  p_amount numeric default null, p_justification text default null,
+  p_unit uuid default null, p_project uuid default null
+) returns uuid language plpgsql security definer set search_path = public as $$
+declare v_id uuid; r record;
+begin
+  if not public.is_active_user() then raise exception 'Compte inactif' using errcode = '42501'; end if;
+  if length(trim(coalesce(p_label, ''))) < 3 then raise exception 'Précisez l''objet de la demande'; end if;
+
+  select id into v_id from public.approval_requests
+   where kind = p_kind and subject_id = p_subject and status = 'pending' and p_subject is not null;
+  if v_id is not null then return v_id; end if;
+
+  insert into public.approval_requests (kind, subject_id, subject_label, amount, justification, unit_id, project_id)
+  values (p_kind, p_subject, trim(p_label), p_amount, nullif(trim(coalesce(p_justification, '')), ''), p_unit, p_project)
+  returning id into v_id;
+
+  for r in
+    select p.id from public.profiles p where p.status = 'active' and p.system_role = 'ceo'
+    union
+    select g.profile_id from public.role_grants g
+     where g.permission = 'approvals.decide' and (g.expires_at is null or g.expires_at > now())
+  loop
+    perform public.notify(r.id, 'approval.requested', 'Décision attendue : ' || trim(p_label),
+      case when p_amount is not null then to_char(p_amount, 'FM999G999G999D00') || ' XOF' else null end,
+      '/validations?demande=' || v_id);
+  end loop;
+  return v_id;
+end $$;
+grant execute on function public.request_approval(public.approval_kind, uuid, text, numeric, text, uuid, uuid) to authenticated;
+
+/** Accord ou refus du CEO, toujours motivé côté refus. */
+create or replace function public.decide_approval(p_id uuid, p_approve boolean, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare a public.approval_requests;
+begin
+  if not public.can_decide_approvals() then
+    raise exception 'Cette décision revient au CEO' using errcode = '42501';
+  end if;
+  select * into a from public.approval_requests where id = p_id for update;
+  if a.id is null then raise exception 'Demande introuvable'; end if;
+  if a.status <> 'pending' then raise exception 'Cette demande a déjà été traitée'; end if;
+  if not p_approve and length(trim(coalesce(p_note, ''))) < 3 then
+    raise exception 'Motivez le refus : la personne doit savoir quoi corriger';
+  end if;
+
+  update public.approval_requests
+     set status = case when p_approve then 'approved' else 'rejected' end::public.approval_status,
+         decided_by = auth.uid(), decided_at = now(), decision_note = nullif(trim(coalesce(p_note, '')), '')
+   where id = p_id;
+
+  perform public.notify(a.requested_by,
+    case when p_approve then 'approval.approved' else 'approval.rejected' end,
+    case when p_approve then 'Accord du CEO : ' else 'Refus : ' end || a.subject_label,
+    nullif(trim(coalesce(p_note, '')), ''), '/validations?demande=' || a.id);
+end $$;
+grant execute on function public.decide_approval(uuid, boolean, text) to authenticated;
+
+/** Annule sa propre demande tant qu'elle n'est pas tranchée. */
+create or replace function public.cancel_approval(p_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  update public.approval_requests set status = 'cancelled'
+   where id = p_id and status = 'pending' and (requested_by = auth.uid() or public.can_decide_approvals());
+  if not found then raise exception 'Demande introuvable ou déjà tranchée'; end if;
+end $$;
+grant execute on function public.cancel_approval(uuid) to authenticated;
+
+alter table public.approval_requests enable row level security;
+grant select, insert, update on public.approval_requests to authenticated;
+drop policy if exists "validations: lecture" on public.approval_requests;
+create policy "validations: lecture" on public.approval_requests for select to authenticated
+  using (public.is_active_user() and (
+    requested_by = auth.uid() or public.can_decide_approvals()
+    or public.has_perm('dashboard.exec')
+    or (unit_id is not null and public.has_perm('unit.manage', unit_id))
+    or (project_id is not null and public.can_view_project(project_id))));
+-- Écriture par les fonctions ci-dessus uniquement.
+
+-- -----------------------------------------------------------------------------
+-- 2. Budgets et dépenses : le seuil déclenche l'accord du CEO
+-- -----------------------------------------------------------------------------
+do $budgets$
+declare v_first_run boolean := not exists (
+  select 1 from information_schema.columns
+   where table_schema = 'public' and table_name = 'budgets' and column_name = 'status');
+begin
+  alter table public.budgets
+    add column if not exists status text not null default 'draft' check (status in ('draft', 'active')),
+    add column if not exists project_id uuid references public.projects(id) on delete cascade;
+  alter table public.budgets alter column unit_id drop not null;
+  alter table public.budgets drop constraint if exists budgets_scope_chk;
+  alter table public.budgets add constraint budgets_scope_chk check (unit_id is not null or project_id is not null);
+  -- Les budgets déjà en place existaient avant le circuit de validation : ils restent actifs.
+  if v_first_run then update public.budgets set status = 'active'; end if;
+end $budgets$;
+comment on column public.budgets.project_id is 'Budget d''un projet de la holding (sinon budget d''unité).';
+-- Un seul budget par projet et par exercice, comme pour les unités.
+create unique index if not exists budgets_project_year on public.budgets(project_id, fiscal_year) where project_id is not null;
+
+-- Le chef de projet voit le budget de son projet ; sa gestion reste à la finance.
+drop policy if exists "budgets: lecture" on public.budgets;
+drop policy if exists "budgets: lecture" on public.budgets;
+create policy "budgets: lecture" on public.budgets for select to authenticated
+  using (public.can_read_finance() or public.has_perm('unit.manage', unit_id)
+         or (project_id is not null and public.can_view_project(project_id)));
+
+create or replace function public.budgets_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is not null
+     and new.status = 'active'
+     and new.amount > public.ceo_approval_threshold()
+     and not public.approval_granted('budget', new.id)
+     and not public.is_ceo() then
+    raise exception 'Ce budget dépasse le seuil : l''accord du CEO est requis avant activation.' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+drop trigger if exists budgets_guard_biu on public.budgets;
+create trigger budgets_guard_biu before insert or update on public.budgets
+  for each row execute function public.budgets_guard();
+
+alter table public.transactions
+  add column if not exists approval_id uuid references public.approval_requests(id) on delete set null;
+
+create or replace function public.transactions_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is not null and new.type = 'expense'
+     and new.amount > public.ceo_approval_threshold() and not public.is_ceo() then
+    if not exists (
+      select 1 from public.approval_requests a
+      where a.id = new.approval_id and a.kind = 'expense' and a.status = 'approved'
+        and coalesce(a.amount, 0) >= new.amount
+    ) then
+      raise exception 'Dépense au-dessus du seuil : rattachez-la à un accord du CEO portant au moins ce montant.' using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists transactions_guard_biu on public.transactions;
+create trigger transactions_guard_biu before insert or update on public.transactions
+  for each row execute function public.transactions_guard();
+
+-- -----------------------------------------------------------------------------
+-- 3. Lancement d'un projet et embauches : accord du CEO
+-- -----------------------------------------------------------------------------
+alter table public.projects
+  add column if not exists approved_by uuid references public.profiles(id) on delete set null,
+  add column if not exists approved_at timestamptz;
+update public.projects set approved_at = created_at where status <> 'planned' and approved_at is null;
+
+create or replace function public.projects_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'active' and (tg_op = 'INSERT' or old.status <> 'active') then
+    if auth.uid() is not null and not public.is_ceo() and not public.approval_granted('project', new.id) then
+      raise exception 'Le lancement d''un projet demande l''accord du CEO. Soumettez-le depuis la fiche du projet.' using errcode = '42501';
+    end if;
+    new.approved_at := coalesce(new.approved_at, now());
+    new.approved_by := coalesce(new.approved_by, auth.uid());
+  end if;
+  return new;
+end $$;
+drop trigger if exists projects_guard_biu on public.projects;
+create trigger projects_guard_biu before insert or update on public.projects
+  for each row execute function public.projects_guard();
+
+alter table public.employment_contracts
+  add column if not exists status text not null default 'draft' check (status in ('draft', 'pending_ceo', 'signed', 'ended')),
+  add column if not exists approved_by uuid references public.profiles(id) on delete set null,
+  add column if not exists approved_at timestamptz;
+update public.employment_contracts set status = 'signed', approved_at = created_at where approved_at is null;
+
+create or replace function public.employment_contracts_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'signed' and (tg_op = 'INSERT' or old.status <> 'signed') then
+    if auth.uid() is not null and not public.is_ceo() and not public.approval_granted('employment_contract', new.id) then
+      raise exception 'La signature d''un contrat de travail demande l''accord du CEO.' using errcode = '42501';
+    end if;
+    new.approved_at := coalesce(new.approved_at, now());
+    new.approved_by := coalesce(new.approved_by, auth.uid());
+  end if;
+  return new;
+end $$;
+drop trigger if exists employment_contracts_guard_biu on public.employment_contracts;
+create trigger employment_contracts_guard_biu before insert or update on public.employment_contracts
+  for each row execute function public.employment_contracts_guard();
+
+-- -----------------------------------------------------------------------------
+-- 4. Calendrier opérationnel des projets
+-- -----------------------------------------------------------------------------
+do $enum$ begin
+  create type public.cycle_kind as enum ('monthly', 'weekly', 'daily');
+exception when duplicate_object then null;
+end $enum$;
+do $enum$ begin
+  create type public.cycle_status as enum ('draft', 'pending_ceo', 'published', 'closed');
+exception when duplicate_object then null;
+end $enum$;
+do $enum$ begin
+  create type public.ops_item_status as enum ('planned', 'in_progress', 'done', 'dropped');
+exception when duplicate_object then null;
+end $enum$;
+
+create table if not exists public.operation_cycles (
+  id              uuid primary key default gen_random_uuid(),
+  project_id      uuid not null references public.projects(id) on delete cascade,
+  parent_cycle_id uuid references public.operation_cycles(id) on delete set null,  -- hebdo/journalier rattaché au mensuel
+  kind            public.cycle_kind   not null,
+  status          public.cycle_status not null default 'draft',
+  period_start    date not null,
+  period_end      date not null,
+  title           text not null check (length(trim(title)) > 2),
+  focus           text,                    -- le cap du cycle, en une phrase
+  created_by      uuid references public.profiles(id) on delete set null default auth.uid(),
+  published_at    timestamptz,
+  closed_at       timestamptz,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now(),
+  check (period_end >= period_start),
+  unique (project_id, kind, period_start)
+);
+create index if not exists operation_cycles_project_idx on public.operation_cycles(project_id, period_start desc);
+create index if not exists operation_cycles_open_idx    on public.operation_cycles(status, period_end) where status = 'published';
+drop trigger if exists operation_cycles_updated_at on public.operation_cycles;
+create trigger operation_cycles_updated_at before update on public.operation_cycles
+  for each row execute function public.set_updated_at();
+
+-- Les grandes lignes : ce que les Opérations attendent du projet sur la période.
+create table if not exists public.operation_items (
+  id                uuid primary key default gen_random_uuid(),
+  cycle_id          uuid not null references public.operation_cycles(id) on delete cascade,
+  title             text not null check (length(trim(title)) > 2),
+  detail            text,
+  expected_outcome  text,                  -- le résultat attendu, vérifiable
+  owner_id          uuid references public.profiles(id) on delete set null,
+  due_date          date,
+  status            public.ops_item_status not null default 'planned',
+  position          double precision not null default extract(epoch from now()),
+  created_at        timestamptz not null default now(),
+  updated_at        timestamptz not null default now()
+);
+create index if not exists operation_items_cycle_idx on public.operation_items(cycle_id, position);
+drop trigger if exists operation_items_updated_at on public.operation_items;
+create trigger operation_items_updated_at before update on public.operation_items
+  for each row execute function public.set_updated_at();
+
+-- Une tâche peut découler d'une grande ligne : c'est le lien entre le plan des
+-- Opérations et le travail réel de l'équipe.
+alter table public.tasks
+  add column if not exists operation_item_id uuid references public.operation_items(id) on delete set null;
+create index if not exists tasks_operation_item_idx on public.tasks(operation_item_id);
+
+create table if not exists public.operation_reports (
+  id           uuid primary key default gen_random_uuid(),
+  cycle_id     uuid not null references public.operation_cycles(id) on delete cascade,
+  project_id   uuid not null references public.projects(id) on delete cascade,
+  author_id    uuid references public.profiles(id) on delete set null default auth.uid(),
+  progress     int not null default 0 check (progress between 0 and 100),
+  summary      text not null check (length(trim(summary)) > 10),
+  blockers     text,
+  next_steps   text,
+  status       text not null default 'submitted' check (status in ('draft', 'submitted', 'acknowledged')),
+  submitted_at timestamptz,
+  reviewed_by  uuid references public.profiles(id) on delete set null,
+  reviewed_at  timestamptz,
+  review_note  text,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+create index if not exists operation_reports_cycle_idx on public.operation_reports(cycle_id, created_at desc);
+create index if not exists operation_reports_queue_idx on public.operation_reports(status) where status = 'submitted';
+drop trigger if exists operation_reports_updated_at on public.operation_reports;
+create trigger operation_reports_updated_at before update on public.operation_reports
+  for each row execute function public.set_updated_at();
+
+/** Qui écrit le calendrier : les Opérations, la direction, à défaut le chef de projet. */
+create or replace function public.can_plan_project(p_project uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.has_perm('ops.plan') or public.has_perm('projects.admin') or public.is_ceo()
+      or public.is_project_lead(p_project)
+$$;
+grant execute on function public.can_plan_project(uuid) to authenticated;
+
+/** Publication : le mensuel passe par le CEO, l'hebdomadaire et le journalier non. */
+create or replace function public.publish_operation_cycle(p_cycle uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare c public.operation_cycles; r record; v_project text;
+begin
+  select * into c from public.operation_cycles where id = p_cycle for update;
+  if c.id is null then raise exception 'Cycle introuvable'; end if;
+  if not public.can_plan_project(c.project_id) then raise exception 'Permission refusée' using errcode = '42501'; end if;
+  if c.status = 'published' then return; end if;
+  if not exists (select 1 from public.operation_items where cycle_id = p_cycle) then
+    raise exception 'Ajoutez au moins une grande ligne avant de publier ce calendrier.';
+  end if;
+
+  if c.kind = 'monthly' and not public.is_ceo() and not public.approval_granted('operation_cycle', p_cycle) then
+    update public.operation_cycles set status = 'pending_ceo' where id = p_cycle;
+    select name into v_project from public.projects where id = c.project_id;
+    perform public.request_approval('operation_cycle', p_cycle,
+      'Calendrier mensuel — ' || coalesce(v_project, 'projet') || ' (' || to_char(c.period_start, 'MM/YYYY') || ')',
+      null, c.focus, null, c.project_id);
+    return;
+  end if;
+
+  update public.operation_cycles set status = 'published', published_at = now() where id = p_cycle;
+  for r in
+    select distinct m.profile_id from public.project_members m where m.project_id = c.project_id
+    union select l.profile_id from public.project_liaisons l where l.project_id = c.project_id
+  loop
+    perform public.notify(r.profile_id, 'ops.cycle.published', 'Calendrier publié : ' || c.title,
+      c.focus, '/projets/' || c.project_id || '?cycle=' || c.id);
+  end loop;
+end $$;
+grant execute on function public.publish_operation_cycle(uuid) to authenticated;
+
+-- L'accord du CEO publie le calendrier sans nouvelle manipulation.
+create or replace function public.approval_requests_apply()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'approved' and old.status = 'pending' and new.kind = 'operation_cycle' and new.subject_id is not null then
+    update public.operation_cycles set status = 'published', published_at = now()
+     where id = new.subject_id and status <> 'published';
+  end if;
+  return null;
+end $$;
+drop trigger if exists approval_requests_apply_au on public.approval_requests;
+create trigger approval_requests_apply_au after update on public.approval_requests
+  for each row execute function public.approval_requests_apply();
+
+/** Rapport du chef de projet aux Opérations, pour un cycle donné. */
+create or replace function public.submit_operation_report(
+  p_cycle uuid, p_progress int, p_summary text, p_blockers text default null, p_next text default null
+) returns uuid language plpgsql security definer set search_path = public as $$
+declare c public.operation_cycles; v_id uuid; r record;
+begin
+  select * into c from public.operation_cycles where id = p_cycle;
+  if c.id is null then raise exception 'Cycle introuvable'; end if;
+  if not (public.is_project_lead(c.project_id) or public.can_manage_project(c.project_id)) then
+    raise exception 'Seul le chef de projet rend compte de ce cycle' using errcode = '42501';
+  end if;
+  insert into public.operation_reports (cycle_id, project_id, progress, summary, blockers, next_steps, status, submitted_at)
+  values (p_cycle, c.project_id, greatest(0, least(100, coalesce(p_progress, 0))), p_summary,
+          nullif(trim(coalesce(p_blockers, '')), ''), nullif(trim(coalesce(p_next, '')), ''), 'submitted', now())
+  returning id into v_id;
+
+  for r in
+    select g.profile_id from public.role_grants g
+     where g.permission in ('ops.plan', 'ops.review') and (g.expires_at is null or g.expires_at > now())
+    union select l.profile_id from public.project_liaisons l
+     join public.org_units u on u.id = l.unit_id and u.domain = 'operations'
+     where l.project_id = c.project_id
+  loop
+    perform public.notify(r.profile_id, 'ops.report.submitted', 'Rapport reçu : ' || c.title,
+      left(p_summary, 140), '/operations?rapport=' || v_id);
+  end loop;
+  return v_id;
+end $$;
+grant execute on function public.submit_operation_report(uuid, int, text, text, text) to authenticated;
+
+create or replace function public.acknowledge_operation_report(p_report uuid, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare r public.operation_reports;
+begin
+  if not (public.has_perm('ops.review') or public.has_perm('ops.plan') or public.is_ceo()) then
+    raise exception 'Permission refusée' using errcode = '42501';
+  end if;
+  select * into r from public.operation_reports where id = p_report;
+  if r.id is null then raise exception 'Rapport introuvable'; end if;
+  update public.operation_reports
+     set status = 'acknowledged', reviewed_by = auth.uid(), reviewed_at = now(),
+         review_note = nullif(trim(coalesce(p_note, '')), '')
+   where id = p_report;
+  perform public.notify(r.author_id, 'ops.report.acknowledged', 'Rapport pris en compte',
+    nullif(trim(coalesce(p_note, '')), ''), '/projets/' || r.project_id);
+end $$;
+grant execute on function public.acknowledge_operation_report(uuid, text) to authenticated;
+
+alter table public.operation_cycles  enable row level security;
+alter table public.operation_items   enable row level security;
+alter table public.operation_reports enable row level security;
+grant select, insert, update, delete on public.operation_cycles  to authenticated;
+grant select, insert, update, delete on public.operation_items   to authenticated;
+grant select, insert, update, delete on public.operation_reports to authenticated;
+
+drop policy if exists "cycles: lecture" on public.operation_cycles;
+create policy "cycles: lecture" on public.operation_cycles for select to authenticated
+  using (public.can_view_project(project_id) or public.has_perm('ops.plan') or public.has_perm('ops.review'));
+drop policy if exists "cycles: écriture" on public.operation_cycles;
+create policy "cycles: écriture" on public.operation_cycles for insert to authenticated
+  with check (public.can_plan_project(project_id));
+drop policy if exists "cycles: modification" on public.operation_cycles;
+create policy "cycles: modification" on public.operation_cycles for update to authenticated
+  using (public.can_plan_project(project_id)) with check (public.can_plan_project(project_id));
+drop policy if exists "cycles: suppression" on public.operation_cycles;
+create policy "cycles: suppression" on public.operation_cycles for delete to authenticated
+  using (public.can_plan_project(project_id) and status <> 'published');
+
+drop policy if exists "lignes: lecture" on public.operation_items;
+create policy "lignes: lecture" on public.operation_items for select to authenticated
+  using (exists (select 1 from public.operation_cycles c where c.id = cycle_id
+                  and (public.can_view_project(c.project_id) or public.has_perm('ops.plan'))));
+drop policy if exists "lignes: gestion" on public.operation_items;
+create policy "lignes: gestion" on public.operation_items for all to authenticated
+  using (exists (select 1 from public.operation_cycles c where c.id = cycle_id and public.can_plan_project(c.project_id)))
+  with check (exists (select 1 from public.operation_cycles c where c.id = cycle_id and public.can_plan_project(c.project_id)));
+
+drop policy if exists "rapports: lecture" on public.operation_reports;
+create policy "rapports: lecture" on public.operation_reports for select to authenticated
+  using (public.can_view_project(project_id) or public.has_perm('ops.review') or public.has_perm('ops.plan') or public.has_perm('dashboard.exec'));
+-- Écriture par submit_operation_report() / acknowledge_operation_report().
+
+-- -----------------------------------------------------------------------------
+-- 5. Juridique : le registre des contrats de la holding
+-- -----------------------------------------------------------------------------
+do $enum$ begin
+  create type public.legal_contract_type as enum ('nda', 'partnership', 'client', 'supplier', 'licence', 'employment', 'statutory', 'other');
+exception when duplicate_object then null;
+end $enum$;
+do $enum$ begin
+  create type public.legal_contract_status as enum ('draft', 'legal_review', 'pending_ceo', 'signed', 'active', 'expired', 'terminated');
+exception when duplicate_object then null;
+end $enum$;
+
+create sequence if not exists public.legal_contract_seq;
+
+create table if not exists public.legal_contracts (
+  id                  uuid primary key default gen_random_uuid(),
+  reference           text unique not null default ('JUR-' || to_char(now(), 'YYYY') || '-' || lpad(nextval('public.legal_contract_seq')::text, 4, '0')),
+  title               text not null check (length(trim(title)) > 2),
+  type                public.legal_contract_type   not null default 'other',
+  status              public.legal_contract_status not null default 'draft',
+  counterparty        text not null check (length(trim(counterparty)) > 1),
+  account_id          uuid references public.accounts(id)    on delete set null,
+  project_id          uuid references public.projects(id)    on delete set null,
+  unit_id             uuid references public.org_units(id)   on delete set null,
+  owner_id            uuid references public.profiles(id)    on delete set null default auth.uid(),
+  document_id         uuid references public.documents(id)   on delete set null,
+  amount              numeric(16,2),
+  currency            text not null default 'XOF',
+  risk                text not null default 'low' check (risk in ('low', 'medium', 'high')),
+  signed_on           date,
+  effective_date      date,
+  end_date            date,
+  renewal_notice_days int not null default 30 check (renewal_notice_days between 0 and 365),
+  auto_renew          boolean not null default false,
+  obligations         text,             -- engagements à tenir, en clair
+  notes               text,
+  created_by          uuid references public.profiles(id) on delete set null default auth.uid(),
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now(),
+  check (end_date is null or effective_date is null or end_date >= effective_date)
+);
+create index if not exists legal_contracts_status_idx  on public.legal_contracts(status, end_date);
+create index if not exists legal_contracts_project_idx on public.legal_contracts(project_id);
+create index if not exists legal_contracts_end_idx     on public.legal_contracts(end_date) where status in ('signed', 'active');
+drop trigger if exists legal_contracts_updated_at on public.legal_contracts;
+create trigger legal_contracts_updated_at before update on public.legal_contracts
+  for each row execute function public.set_updated_at();
+drop trigger if exists audit_legal_contracts on public.legal_contracts;
+create trigger audit_legal_contracts after insert or update or delete on public.legal_contracts
+  for each row execute function public.audit_trigger();
+
+/** Signature : revue juridique puis accord du CEO. */
+create or replace function public.legal_contracts_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status in ('signed', 'active') and (tg_op = 'INSERT' or old.status not in ('signed', 'active')) then
+    if auth.uid() is not null and not public.is_ceo() and not public.approval_granted('legal_contract', new.id) then
+      raise exception 'Ce contrat doit recevoir l''accord du CEO avant signature.' using errcode = '42501';
+    end if;
+    new.signed_on := coalesce(new.signed_on, current_date);
+    new.effective_date := coalesce(new.effective_date, new.signed_on);
+  end if;
+  return new;
+end $$;
+drop trigger if exists legal_contracts_guard_biu on public.legal_contracts;
+create trigger legal_contracts_guard_biu before insert or update on public.legal_contracts
+  for each row execute function public.legal_contracts_guard();
+
+/** Soumet un contrat à la signature du CEO (après revue juridique). */
+create or replace function public.submit_contract_for_signature(p_contract uuid, p_justification text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare c public.legal_contracts; v_id uuid;
+begin
+  select * into c from public.legal_contracts where id = p_contract;
+  if c.id is null then raise exception 'Contrat introuvable'; end if;
+  if not (public.has_perm('legal.admin') or c.owner_id = auth.uid() or public.is_ceo()) then
+    raise exception 'Permission refusée' using errcode = '42501';
+  end if;
+  update public.legal_contracts set status = 'pending_ceo' where id = p_contract and status in ('draft', 'legal_review');
+  v_id := public.request_approval('legal_contract', p_contract,
+    'Contrat ' || c.reference || ' — ' || c.title || ' (' || c.counterparty || ')',
+    c.amount, p_justification, c.unit_id, c.project_id);
+  return v_id;
+end $$;
+grant execute on function public.submit_contract_for_signature(uuid, text) to authenticated;
+
+alter table public.legal_contracts enable row level security;
+grant select, insert, update, delete on public.legal_contracts to authenticated;
+drop policy if exists "contrats: lecture" on public.legal_contracts;
+create policy "contrats: lecture" on public.legal_contracts for select to authenticated
+  using (public.has_perm('legal.view') or public.has_perm('legal.admin') or public.has_perm('dashboard.exec')
+         or owner_id = auth.uid()
+         or (project_id is not null and public.is_project_lead(project_id)));
+drop policy if exists "contrats: rédaction" on public.legal_contracts;
+create policy "contrats: rédaction" on public.legal_contracts for insert to authenticated
+  with check (public.has_perm('legal.admin') or public.is_ceo());
+drop policy if exists "contrats: modification" on public.legal_contracts;
+create policy "contrats: modification" on public.legal_contracts for update to authenticated
+  using (public.has_perm('legal.admin') or public.is_ceo())
+  with check (public.has_perm('legal.admin') or public.is_ceo());
+drop policy if exists "contrats: suppression" on public.legal_contracts;
+create policy "contrats: suppression" on public.legal_contracts for delete to authenticated
+  using ((public.has_perm('legal.admin') or public.is_ceo()) and status = 'draft');
+
+-- -----------------------------------------------------------------------------
+-- 6. Tâches : répartition hiérarchique et vérification
+-- -----------------------------------------------------------------------------
+alter table public.tasks
+  add column if not exists submitted_at timestamptz,
+  add column if not exists reviewer_id  uuid references public.profiles(id) on delete set null,
+  add column if not exists review_note  text;
+
+/** Qui peut confier une tâche à qui : soi-même, son équipe projet, son unité. */
+create or replace function public.can_assign_task(p_assignee uuid, p_project uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select case
+    when p_assignee is null then true
+    when p_assignee = auth.uid() then
+      p_project is null or public.can_view_project(p_project)
+    when public.has_perm('projects.admin') or public.is_ceo() then true
+    when p_project is not null and public.can_manage_project(p_project) then
+      exists (select 1 from public.project_members m where m.project_id = p_project and m.profile_id = p_assignee)
+    when public.manages_profile(p_assignee) then true
+    else exists (
+      select 1 from public.unit_memberships m
+      where m.profile_id = p_assignee and m.end_date is null and public.has_perm('unit.assign', m.unit_id))
+  end
+$$;
+grant execute on function public.can_assign_task(uuid, uuid) to authenticated;
+
+/**
+ * Règles d'écriture des tâches :
+ *   * on ne confie une tâche qu'à soi-même, à son équipe projet ou à son unité ;
+ *   * une tâche confiée à quelqu'un d'autre passe par une vérification ;
+ *   * le vérificateur est celui qui a assigné la tâche.
+ */
+create or replace function public.tasks_assignment_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is not null
+     and new.assignee_id is not null
+     and (tg_op = 'INSERT' or new.assignee_id is distinct from old.assignee_id)
+     and not public.can_assign_task(new.assignee_id, new.project_id) then
+    raise exception 'Vous ne pouvez confier une tâche qu''à vous-même ou aux personnes que vous encadrez.' using errcode = '42501';
+  end if;
+
+  if tg_op = 'INSERT' then
+    if new.assignee_id is not null and new.assignee_id is distinct from coalesce(new.reporter_id, auth.uid()) then
+      new.requires_validation := true;
+      new.reviewer_id := coalesce(new.reviewer_id, new.reporter_id, auth.uid());
+    end if;
+  elsif new.assignee_id is distinct from old.assignee_id and new.assignee_id is distinct from auth.uid() then
+    new.reviewer_id := coalesce(new.reviewer_id, auth.uid());
+  end if;
+  return new;
+end $$;
+drop trigger if exists tasks_assignment_biu on public.tasks;
+create trigger tasks_assignment_biu before insert or update on public.tasks
+  for each row execute function public.tasks_assignment_guard();
+
+/** Le titulaire soumet sa tâche à vérification. */
+create or replace function public.submit_task(p_task uuid, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare t public.tasks; v_reviewer uuid; v_link text;
+begin
+  select * into t from public.tasks where id = p_task for update;
+  if t.id is null then raise exception 'Tâche introuvable'; end if;
+  if t.assignee_id is distinct from auth.uid() then
+    raise exception 'Seule la personne en charge peut soumettre cette tâche' using errcode = '42501';
+  end if;
+  if t.status = 'done' then raise exception 'Cette tâche est déjà terminée'; end if;
+
+  v_reviewer := coalesce(t.reviewer_id, t.reporter_id);
+  v_link := case when t.project_id is not null then '/projets/' || t.project_id || '?tache=' || t.id else '/taches' end;
+
+  if v_reviewer is null or v_reviewer = auth.uid() then
+    -- Tâche personnelle : rien à vérifier, elle est terminée.
+    update public.tasks set status = 'done', submitted_at = now(), review_note = nullif(trim(coalesce(p_note, '')), '')
+     where id = p_task;
+    return;
+  end if;
+
+  update public.tasks
+     set status = 'review', submitted_at = now(), requires_validation = true,
+         reviewer_id = v_reviewer, review_note = nullif(trim(coalesce(p_note, '')), '')
+   where id = p_task;
+  perform public.notify(v_reviewer, 'task.submitted', 'À vérifier : ' || t.title,
+    nullif(trim(coalesce(p_note, '')), ''), v_link);
+end $$;
+grant execute on function public.submit_task(uuid, text) to authenticated;
+
+/** Le vérificateur valide ou renvoie la tâche, motif à l'appui. */
+create or replace function public.review_task(p_task uuid, p_approve boolean, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare t public.tasks; v_link text;
+begin
+  select * into t from public.tasks where id = p_task for update;
+  if t.id is null then raise exception 'Tâche introuvable'; end if;
+  if not (coalesce(t.reviewer_id, t.reporter_id) = auth.uid()
+          or (t.project_id is not null and public.can_manage_project(t.project_id))
+          or public.is_ceo()) then
+    raise exception 'Cette vérification revient à la personne qui a confié la tâche' using errcode = '42501';
+  end if;
+  if not p_approve and length(trim(coalesce(p_note, ''))) < 3 then
+    raise exception 'Indiquez ce qui doit être repris';
+  end if;
+
+  v_link := case when t.project_id is not null then '/projets/' || t.project_id || '?tache=' || t.id else '/taches' end;
+
+  if p_approve then
+    update public.tasks
+       set status = 'done', validated_by = auth.uid(), validated_at = now(),
+           completed_at = coalesce(completed_at, now()), review_note = nullif(trim(coalesce(p_note, '')), '')
+     where id = p_task;
+    perform public.notify(t.assignee_id, 'task.validated', 'Tâche validée : ' || t.title, nullif(trim(coalesce(p_note, '')), ''), v_link);
+  else
+    update public.tasks
+       set status = 'in_progress', submitted_at = null, review_note = trim(p_note)
+     where id = p_task;
+    perform public.notify(t.assignee_id, 'task.rejected', 'À reprendre : ' || t.title, trim(p_note), v_link);
+  end if;
+end $$;
+grant execute on function public.review_task(uuid, boolean, text) to authenticated;
+
+-- La validation passe désormais par review_task() : le titulaire ne clôt pas
+-- lui-même une tâche qui lui a été confiée.
+create or replace function public.tasks_before_write()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare blocker text;
+begin
+  if tg_op = 'UPDATE' and new.status is distinct from old.status then
+    if new.status in ('in_progress', 'review', 'done') then
+      select t.title into blocker
+      from public.task_dependencies d join public.tasks t on t.id = d.depends_on_id
+      where d.task_id = new.id and t.status <> 'done' limit 1;
+      if blocker is not null then
+        raise exception 'Tâche bloquée : « % » doit d''abord être terminée', blocker;
+      end if;
+    end if;
+
+    if new.status = 'done' and new.requires_validation and auth.uid() is not null
+       and new.validated_by is distinct from auth.uid() then
+      if not (coalesce(new.reviewer_id, new.reporter_id) = auth.uid()
+              or (new.project_id is not null and public.can_manage_project(new.project_id))) then
+        raise exception 'Cette tâche doit être vérifiée : soumettez-la plutôt pour validation.';
+      end if;
+      new.validated_by := auth.uid();
+      new.validated_at := now();
+    end if;
+
+    if new.status = 'done' then
+      new.completed_at := coalesce(new.completed_at, now());
+    else
+      new.completed_at := null;
+      new.validated_by := null;
+      new.validated_at := null;
+    end if;
+  end if;
+
+  if tg_op = 'INSERT' and new.status = 'done' then
+    new.completed_at := now();
+  end if;
+  return new;
+end $$;
+
+create or replace function public.tasks_after_write()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  link text := case when new.project_id is not null then '/projets/' || new.project_id || '?tache=' || new.id else '/taches' end;
+begin
+  if new.assignee_id is not null and (tg_op = 'INSERT' or new.assignee_id is distinct from old.assignee_id) then
+    perform public.notify(new.assignee_id, 'task.assigned', 'Nouvelle tâche : ' || new.title,
+      case when new.due_date is not null then 'À rendre le ' || to_char(new.due_date, 'DD/MM/YYYY') else null end, link);
+  end if;
+  if tg_op = 'UPDATE' and new.status = 'review' and old.status <> 'review' and new.requires_validation then
+    perform public.notify(coalesce(new.reviewer_id, new.reporter_id), 'task.submitted',
+      'À vérifier : ' || new.title, null, link);
+  end if;
+  if tg_op = 'UPDATE' and new.status = 'done' and old.status <> 'done' and new.reporter_id is not null then
+    perform public.notify(new.reporter_id, 'task.done', 'Tâche terminée : ' || new.title, null, link);
+  end if;
+  return null;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- 7. Notifications : catégories des nouveaux événements
+-- -----------------------------------------------------------------------------
+create or replace function public.notification_category(p_kind text)
+returns text language sql immutable as $$
+  select case
+    when p_kind like 'approval.%' or p_kind in ('task.review', 'task.submitted', 'leave.requested', 'reminder.reviews', 'reminder.leaves', 'reminder.approvals') then 'approvals'
+    when p_kind like 'message.%'  then 'messages'
+    when p_kind like 'ops.%' or p_kind like 'project.%' or p_kind = 'reminder.report' then 'projects'
+    when p_kind like 'legal.%' or p_kind = 'reminder.contract' then 'legal'
+    when p_kind like 'task.%' or p_kind in ('reminder.due', 'reminder.overdue') then 'tasks'
+    when p_kind like 'drive.%'    then 'documents'
+    when p_kind like 'meeting.%' or p_kind = 'reminder.meeting' then 'meetings'
+    when p_kind like 'leave.%' or p_kind like 'hr.%' then 'hr'
+    when p_kind = 'announcement'  then 'announcements'
+    else 'other'
+  end
+$$;
+
+-- Rappels quotidiens : contrats qui arrivent à échéance, décisions en attente,
+-- rapports de cycle non rendus.
+create or replace function public.generate_extra_reminders()
+returns int language plpgsql security definer set search_path = public as $$
+declare today date := (now() at time zone 'Africa/Porto-Novo')::date; n int := 0; r record;
+begin
+  -- Contrats dont le préavis de renouvellement court
+  for r in
+    select c.id, c.reference, c.title, c.end_date, c.owner_id
+    from public.legal_contracts c
+    where c.status in ('signed', 'active') and c.end_date is not null
+      and c.end_date - c.renewal_notice_days <= today and c.end_date >= today
+  loop
+    perform public.notify(r.owner_id, 'reminder.contract',
+      'Échéance contrat : ' || r.reference,
+      r.title || ' arrive à terme le ' || to_char(r.end_date, 'DD/MM/YYYY') || '.', '/juridique?contrat=' || r.id);
+    n := n + 1;
+  end loop;
+
+  -- Décisions en attente depuis plus de deux jours
+  for r in
+    select p.id from public.profiles p where p.status = 'active' and p.system_role = 'ceo'
+      and exists (select 1 from public.approval_requests a where a.status = 'pending' and a.created_at < now() - interval '2 days')
+  loop
+    perform public.notify(r.id, 'reminder.approvals', 'Des décisions attendent votre accord', null, '/validations');
+    n := n + 1;
+  end loop;
+
+  -- Cycles terminés sans rapport
+  for r in
+    select c.id, c.title, c.project_id, p.lead_id
+    from public.operation_cycles c join public.projects p on p.id = c.project_id
+    where c.status = 'published' and c.period_end < today and p.lead_id is not null
+      and not exists (select 1 from public.operation_reports o where o.cycle_id = c.id)
+  loop
+    perform public.notify(r.lead_id, 'reminder.report', 'Rapport attendu : ' || r.title,
+      'Le cycle est terminé : rendez compte aux Opérations.', '/projets/' || r.project_id || '?cycle=' || r.id);
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+revoke execute on function public.generate_extra_reminders() from public, anon, authenticated;
+
+do $$
+begin
+  perform cron.schedule('veriion-extra-reminders', '30 6 * * *', 'select public.generate_extra_reminders()');
+exception when others then
+  raise notice 'pg_cron non disponible : rappels juridiques et rapports à planifier plus tard (%)', sqlerrm;
+end $$;
+
+-- Les modèles de droits ont changé (Opérations, Juridique) : on recalcule les
+-- droits automatiques de chacun, sinon seules les prochaines nominations en
+-- bénéficieraient.
+do $$ declare r record; begin
+  for r in select id from public.profiles where status = 'active' loop
+    perform public.sync_auto_grants(r.id);
+  end loop;
+end $$;
+
 -- >>>>>>>>>> supabase/seed.sql
 -- =============================================================================
--- VERIION OS — Données initiales : structure de l'organisation et référentiel KPI
+-- VERIION OS — Données initiales : structure de la holding et référentiel KPI
 -- À exécuter une fois, après les migrations.
+-- =============================================================================
+-- VERIION est une holding : une équipe administrative transverse, et autant de
+-- projets que de produits. Les départements ci-dessous coordonnent chaque
+-- projet ; les projets, eux, se créent depuis l'application (un Chief Product,
+-- une équipe, un référent par département).
 -- =============================================================================
 
 do $$
 declare
-  root uuid; dg uuid; ops uuid; tech uuid; dev uuid; mkt uuid; biz uuid; fin uuid;
+  root uuid; dg uuid; ops uuid; tech uuid; dev uuid; mkt uuid; biz uuid; fin uuid; leg uuid; rh uuid;
 begin
   if exists (select 1 from public.org_units) then
     raise notice 'Organisation déjà initialisée — aucune action.';
     return;
   end if;
 
-  insert into public.org_units (name, code, kind, domain, color, sort_order, description)
-  values ('VERIION', 'VRN', 'company', 'direction', '#050816', 0, 'L''écosystème numérique de l''Afrique')
+  insert into public.org_units (name, code, kind, domain, color, sort_order, description, head_title, deputy_title, is_core)
+  values ('VERIION', 'VRN', 'company', 'direction', '#050816', 0,
+          'La holding : l''écosystème numérique de l''Afrique',
+          'CEO — Directeur Général', 'Directeur Général Adjoint', true)
   returning id into root;
 
-  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description) values
-    (root, 'Direction Générale', 'DG',   'department', 'direction',  '#0B1F3A', 1, 'Vision, arbitrages et pilotage de l''entreprise')
+  -- ── Équipe administrative : les fonctions transverses de la holding ────────
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Direction Générale',   'DG',   'department', 'direction',  '#0B1F3A', 1,
+     'Vision, arbitrages, validations et pilotage de la holding',
+     'CEO — Directeur Général', 'Directeur Général Adjoint', 'Chargé de mission', true)
   returning id into dg;
-  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description) values
-    (root, 'Opérations',         'OPS',  'department', 'operations', '#0E7490', 2, 'Exécution, gestion de projets et qualité')
+
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Opérations',           'OPS',  'department', 'operations', '#0E7490', 2,
+     'Calendrier opérationnel des projets, exécution, qualité et reporting',
+     'COO — Directeur des Opérations', 'Responsable des Opérations', 'Chargé des opérations', true)
   returning id into ops;
-  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description) values
-    (root, 'Technologie',        'TECH', 'department', 'technology', '#4F46E5', 3, 'Produits, plateformes et infrastructure')
+
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Technologie',          'TECH', 'department', 'technology', '#4F46E5', 3,
+     'Plateformes, architecture, infrastructure et sécurité des produits',
+     'CTO — Directeur Technique', 'Responsable Technique', 'Ingénieur', true)
   returning id into tech;
-  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description) values
-    (root, 'Marketing',          'MKT',  'department', 'marketing',  '#DB2777', 4, 'Acquisition, communication et contenu')
-  returning id into mkt;
-  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description) values
-    (root, 'Business',           'BIZ',  'department', 'business',   '#EA580C', 5, 'Ventes et partenariats')
-  returning id into biz;
-  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description) values
-    (root, 'Finance',            'FIN',  'department', 'finance',    '#059669', 6, 'Comptabilité, trésorerie et contrôle financier')
+
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Finance',              'FIN',  'department', 'finance',    '#059669', 4,
+     'Budgets, trésorerie, facturation et contrôle financier des projets',
+     'CFO — Directeur Financier', 'Responsable Financier', 'Chargé de gestion', true)
   returning id into fin;
 
-  insert into public.org_units (parent_id, name, code, kind, color, sort_order) values
-    (dg,   'Cabinet du CEO',      'DG-CAB',  'subdepartment', '#0B1F3A', 1),
-    (ops,  'Gestion de projets',  'OPS-PMO', 'subdepartment', '#0E7490', 1),
-    (ops,  'Qualité',             'OPS-QA',  'subdepartment', '#0E7490', 2),
-    (tech, 'Infrastructure',      'TECH-INF','subdepartment', '#4F46E5', 2),
-    (mkt,  'Acquisition',         'MKT-ACQ', 'subdepartment', '#DB2777', 1),
-    (mkt,  'Communication',       'MKT-COM', 'subdepartment', '#DB2777', 2),
-    (mkt,  'Contenu',             'MKT-CNT', 'subdepartment', '#DB2777', 3),
-    (biz,  'Commercial',          'BIZ-COM', 'subdepartment', '#EA580C', 1),
-    (biz,  'Partenariats',        'BIZ-PAR', 'subdepartment', '#EA580C', 2),
-    (fin,  'Comptabilité',        'FIN-CPT', 'subdepartment', '#059669', 1),
-    (fin,  'Contrôle financier',  'FIN-CTL', 'subdepartment', '#059669', 2);
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Business',             'BIZ',  'department', 'business',   '#EA580C', 5,
+     'Ventes, partenariats et développement commercial des produits',
+     'CBO — Directeur Business', 'Responsable Business', 'Chargé d''affaires', true)
+  returning id into biz;
 
-  insert into public.org_units (parent_id, name, code, kind, color, sort_order)
-  values (tech, 'Développement', 'TECH-DEV', 'subdepartment', '#4F46E5', 1)
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Marketing',            'MKT',  'department', 'marketing',  '#DB2777', 6,
+     'Acquisition, marque, communication et contenu',
+     'CMO — Directeur Marketing', 'Responsable Marketing', 'Chargé marketing', true)
+  returning id into mkt;
+
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Juridique',            'LEG',  'department', 'legal',      '#7C3AED', 7,
+     'Contrats, conformité, propriété intellectuelle et contentieux',
+     'Directeur Juridique', 'Juriste principal', 'Juriste', true)
+  returning id into leg;
+
+  insert into public.org_units (parent_id, name, code, kind, domain, color, sort_order, description, head_title, deputy_title, member_title, is_core) values
+    (root, 'Ressources Humaines',  'RH',   'department', 'hr',         '#0D9488', 8,
+     'Recrutement, contrats de travail, paie et parcours des collaborateurs',
+     'CHRO — Directeur des Ressources Humaines', 'Responsable RH', 'Chargé RH', true)
+  returning id into rh;
+
+  -- ── Sous-départements : la coordination fine des projets ──────────────────
+  insert into public.org_units (parent_id, name, code, kind, color, sort_order, description, head_title) values
+    (dg,   'Cabinet du CEO',         'DG-CAB',  'subdepartment', '#0B1F3A', 1, 'Préparation des arbitrages et suivi des décisions', 'Chef de cabinet'),
+    (ops,  'Planification',          'OPS-PLN', 'subdepartment', '#0E7490', 1, 'Écrit les calendriers mensuels, hebdomadaires et journaliers des projets', 'Responsable planification'),
+    (ops,  'Qualité & Process',      'OPS-QA',  'subdepartment', '#0E7490', 2, 'Méthodes, qualité de livraison et amélioration continue', 'Responsable qualité'),
+    (tech, 'Infrastructure',         'TECH-INF','subdepartment', '#4F46E5', 2, 'Hébergement, sécurité et disponibilité des plateformes', 'Responsable infrastructure'),
+    (fin,  'Comptabilité',           'FIN-CPT', 'subdepartment', '#059669', 1, 'Tenue des comptes et facturation', 'Chef comptable'),
+    (fin,  'Contrôle financier',     'FIN-CTL', 'subdepartment', '#059669', 2, 'Budgets des projets et contrôle des dépenses', 'Contrôleur de gestion'),
+    (biz,  'Commercial',             'BIZ-COM', 'subdepartment', '#EA580C', 1, 'Ventes et relation client', 'Responsable commercial'),
+    (biz,  'Partenariats',           'BIZ-PAR', 'subdepartment', '#EA580C', 2, 'Alliances et développement de l''écosystème', 'Responsable partenariats'),
+    (mkt,  'Acquisition',            'MKT-ACQ', 'subdepartment', '#DB2777', 1, 'Croissance et acquisition d''utilisateurs', 'Responsable acquisition'),
+    (mkt,  'Communication',          'MKT-COM', 'subdepartment', '#DB2777', 2, 'Marque, relations publiques et réseaux', 'Responsable communication'),
+    (mkt,  'Contenu',                'MKT-CNT', 'subdepartment', '#DB2777', 3, 'Production éditoriale et créative', 'Responsable contenu'),
+    (leg,  'Contrats',               'LEG-CTR', 'subdepartment', '#7C3AED', 1, 'Rédaction, revue et suivi des contrats de la holding', 'Responsable contrats'),
+    (leg,  'Conformité',             'LEG-CMP', 'subdepartment', '#7C3AED', 2, 'Conformité réglementaire, données personnelles et risques', 'Responsable conformité'),
+    (rh,   'Recrutement',            'RH-REC',  'subdepartment', '#0D9488', 1, 'Sourcing, entretiens et intégration', 'Responsable recrutement'),
+    (rh,   'Administration du personnel', 'RH-ADP', 'subdepartment', '#0D9488', 2, 'Contrats, paie, congés et dossiers du personnel', 'Responsable administration RH');
+
+  insert into public.org_units (parent_id, name, code, kind, color, sort_order, description, head_title)
+  values (tech, 'Développement', 'TECH-DEV', 'subdepartment', '#4F46E5', 1, 'Conception et développement des produits', 'Responsable développement')
   returning id into dev;
 
-  insert into public.org_units (parent_id, name, code, kind, color, sort_order) values
-    (dev, 'Backend',  'TECH-DEV-BE', 'team', '#4F46E5', 1),
-    (dev, 'Frontend', 'TECH-DEV-FE', 'team', '#4F46E5', 2);
+  insert into public.org_units (parent_id, name, code, kind, color, sort_order, head_title) values
+    (dev, 'Backend',  'TECH-DEV-BE', 'team', '#4F46E5', 1, 'Chef d''équipe Backend'),
+    (dev, 'Frontend', 'TECH-DEV-FE', 'team', '#4F46E5', 2, 'Chef d''équipe Frontend'),
+    (dev, 'Mobile',   'TECH-DEV-MB', 'team', '#4F46E5', 3, 'Chef d''équipe Mobile');
 
-  -- Canal général de l'entreprise
+  -- Canal général de la holding
   insert into public.channels (kind, name, description, is_private)
   values ('group', 'général', 'Échanges ouverts à toute l''équipe VERIION', false);
 end $$;

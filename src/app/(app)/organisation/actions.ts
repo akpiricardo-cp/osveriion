@@ -6,7 +6,9 @@ import { fail, ok, str } from "@/lib/actions";
 import type { ActionResult, MembershipRole, UnitDomain, UnitKind } from "@/lib/types";
 
 const KINDS: UnitKind[] = ["company", "department", "subdepartment", "team"];
-const DOMAINS: UnitDomain[] = ["direction", "operations", "technology", "marketing", "business", "finance", "hr", "other"];
+const DOMAINS: UnitDomain[] = [
+  "direction", "operations", "technology", "product", "marketing", "business", "finance", "legal", "hr", "other",
+];
 
 function refresh(id?: string | null) {
   revalidatePath("/organisation");
@@ -26,6 +28,9 @@ export async function createUnit(_: ActionResult | null, fd: FormData): Promise<
     code: str(fd, "code")?.toUpperCase() ?? null,
     color: str(fd, "color") ?? "#4F46E5",
     description: str(fd, "description"),
+    head_title: str(fd, "head_title"),
+    deputy_title: str(fd, "deputy_title"),
+    member_title: str(fd, "member_title"),
   }).select("id").single();
   if (error) return fail(error);
   refresh(str(fd, "parent_id"));
@@ -40,6 +45,11 @@ export async function updateUnit(_: ActionResult | null, fd: FormData): Promise<
   const patch: Record<string, unknown> = {
     name, description: str(fd, "description"), color: str(fd, "color") ?? "#4F46E5", code: str(fd, "code")?.toUpperCase() ?? null,
   };
+  // Les intitulés de poste suivent l'unité : les changer renomme le poste de la
+  // personne en place à sa prochaine nomination.
+  for (const k of ["head_title", "deputy_title", "member_title"]) {
+    if (fd.has(k)) patch[k] = str(fd, k);
+  }
   const parent = fd.get("parent_id");
   if (parent !== null) patch.parent_id = str(fd, "parent_id");
   const domain = str(fd, "domain");
@@ -83,4 +93,40 @@ export async function endMembership(membershipId: string, unitId: string): Promi
   if (error) return fail(error);
   refresh(unitId);
   return ok("Affectation clôturée. Elle reste visible dans l'historique.");
+}
+
+/**
+ * Fusionne deux unités : membres, sous-unités, canaux, budgets et dossiers
+ * rejoignent l'unité d'accueil, la source est archivée. Réservé au CEO.
+ */
+export async function mergeUnits(sourceId: string, targetId: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.rpc("merge_org_units", { p_source: sourceId, p_target: targetId });
+  if (error) return fail(error);
+  revalidatePath("/organisation", "layout");
+  revalidatePath("/annuaire");
+  return ok("Unités fusionnées. L'unité absorbée est archivée, son historique reste consultable.");
+}
+
+/** Désigne le référent d'un département pour un projet (point de contact du chef de projet). */
+export async function setLiaison(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  const projectId = str(fd, "project_id");
+  const unitId = str(fd, "unit_id");
+  const profileId = str(fd, "profile_id");
+  if (!projectId || !unitId) return fail("Projet ou département manquant.");
+  const supabase = await createClient();
+  if (!profileId) {
+    const { error } = await supabase.from("project_liaisons").delete().eq("project_id", projectId).eq("unit_id", unitId);
+    if (error) return fail(error);
+    revalidatePath("/organisation");
+    revalidatePath(`/projets/${projectId}`);
+    return ok("Référent retiré.");
+  }
+  const { error } = await supabase
+    .from("project_liaisons")
+    .upsert({ project_id: projectId, unit_id: unitId, profile_id: profileId, note: str(fd, "note") }, { onConflict: "project_id,unit_id" });
+  if (error) return fail(error);
+  revalidatePath("/organisation");
+  revalidatePath(`/projets/${projectId}`);
+  return ok("Référent désigné : il rejoint le canal du projet et en est informé.");
 }

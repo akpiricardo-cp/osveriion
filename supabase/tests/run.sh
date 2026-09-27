@@ -28,3 +28,15 @@ for f in supabase/tests/00_supabase_stub.sql supabase/migrations/*.sql supabase/
 done
 psql "$TEST_URL" -v ON_ERROR_STOP=1 -q -f supabase/tests/40_collab_notifications.sql >/dev/null && echo "✔ Scénarios co-édition & notifications OK"
 psql "$PGURL" -qc "drop database if exists $DB" >/dev/null
+psql "$PGURL" -qc "create database $DB" >/dev/null
+for f in supabase/tests/00_supabase_stub.sql supabase/migrations/*.sql supabase/seed.sql; do
+  psql "$TEST_URL" -v ON_ERROR_STOP=1 -q -f "$f" >/dev/null
+done
+psql "$TEST_URL" -v ON_ERROR_STOP=1 -q -f supabase/tests/50_access_code.sql | grep -E "NOTICE|ERREUR" || true
+psql "$PGURL" -qc "drop database if exists $DB" >/dev/null
+psql "$PGURL" -qc "create database $DB" >/dev/null
+for f in supabase/tests/00_supabase_stub.sql supabase/migrations/*.sql supabase/seed.sql; do
+  psql "$TEST_URL" -v ON_ERROR_STOP=1 -q -f "$f" >/dev/null
+done
+psql "$TEST_URL" -v ON_ERROR_STOP=1 -q -f supabase/tests/60_holding.sql | grep -E "NOTICE|ERREUR" || true
+psql "$PGURL" -qc "drop database if exists $DB" >/dev/null

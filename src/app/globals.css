@@ -94,6 +94,14 @@
     color: var(--fg);
     font-feature-settings: "cv11", "ss01";
   }
+  /* Sous 640 px, iOS zoome sur un champ de moins de 16 px : on remonte la taille. */
+  @media (max-width: 639px) {
+    input,
+    select,
+    textarea {
+      font-size: 16px;
+    }
+  }
   ::selection {
     background: color-mix(in srgb, var(--primary) 25%, transparent);
   }
@@ -104,6 +112,10 @@
 }
 
 @layer utilities {
+  /* Zones sures : encoche en haut, barre d'accueil en bas (application installee). */
+  .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
+  .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .h-safe-bottom { height: env(safe-area-inset-bottom, 0px); }
   .scrollbar-thin {
     scrollbar-width: thin;
     scrollbar-color: var(--surface-3) transparent;

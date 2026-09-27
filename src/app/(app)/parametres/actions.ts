@@ -1,9 +1,12 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { fail, ok } from "@/lib/actions";
+import { fail, ok, str } from "@/lib/actions";
+import { ACCESS_CODE_RULE } from "@/lib/access-code";
+import { lockSession, unlockSession } from "@/lib/server/unlock";
 import { NOTIFICATION_CATEGORIES, type NotificationPreferences } from "@/lib/notifications";
 import { dispatchNotifications } from "@/lib/server/dispatch";
 import { mailerConfigured, renderNotificationEmail, sendMail } from "@/lib/server/mailer";
@@ -69,4 +72,31 @@ export async function sendTestEmail(): Promise<ActionResult> {
   } catch (e) {
     return fail(`Envoi impossible : ${e instanceof Error ? e.message : String(e)}`);
   }
+}
+
+/**
+ * Change (ou définit) le code d'accès personnel. La session reste ouverte et le
+ * nouveau code déverrouille immédiatement l'espace sur cet appareil.
+ */
+export async function changeAccessCode(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  const code = str(fd, "code") ?? "";
+  if (!ACCESS_CODE_RULE.test(code)) return fail("Le code doit contenir de 6 à 32 caractères, sans espace.");
+  if (code !== (str(fd, "confirm") ?? "")) return fail("Les deux codes ne correspondent pas.");
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return fail("Session expirée.");
+  const { data: hasCode } = await supabase.rpc("has_access_code");
+  const current = str(fd, "current");
+  if (hasCode && !current) return fail("Saisissez votre code actuel.");
+  const { error } = await supabase.rpc("set_access_code", { p_code: code, p_current: current });
+  if (error) return fail(error);
+  await unlockSession(user.id);
+  revalidatePath("/parametres");
+  return ok("Code d'accès mis à jour.");
+}
+
+/** Verrouille l'espace sur cet appareil sans fermer la session : le code sera redemandé. */
+export async function lockSpaceNow(): Promise<never> {
+  await lockSession();
+  redirect("/verrou");
 }

@@ -38,7 +38,11 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Pro
 
   return (
     <div>
-      <PageHeader title="Projets" description="Tous les projets auxquels vous avez accès, avec leur avancement en temps réel." actions={<ProjectFormButton units={unitOptions(units)} />} />
+      <PageHeader
+        title="Projets"
+        description="Les produits de la holding. Chacun a son Chief Product, son équipe et ses référents dans les départements."
+        actions={<ProjectFormButton units={unitOptions(units)} people={people} />}
+      />
       <LinkTabs
         basePath="/projets"
         active={onglet}

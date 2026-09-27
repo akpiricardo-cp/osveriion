@@ -97,6 +97,23 @@ export async function sendPasswordReset(email: string): Promise<ActionResult> {
   }
 }
 
+/**
+ * Code d'accès oublié : on l'efface. La personne reste connectée sur ses
+ * appareils déjà déverrouillés et choisit un nouveau code à la prochaine session.
+ */
+export async function resetAccessCode(profileId: string): Promise<ActionResult> {
+  try {
+    await requireAdmin();
+    const supabase = await createClient();
+    const { error } = await supabase.rpc("clear_access_code", { p_profile: profileId });
+    if (error) return fail(error);
+    revalidatePath("/admin");
+    return ok("Code d'accès réinitialisé : la personne en définira un nouveau à sa prochaine ouverture.");
+  } catch (e) {
+    return fail(e instanceof Error ? e.message : "Erreur");
+  }
+}
+
 export async function grantException(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();

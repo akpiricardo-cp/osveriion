@@ -4,7 +4,8 @@ import { useCallback, useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
-  Ban, CalendarDays, Check, CheckCircle2, Clock, Link2, Loader2, MessageSquare, Plus, ShieldCheck, Trash2, X,
+  Ban, CalendarDays, Check, CheckCircle2, Clock, Link2, Loader2, MessageSquare, Plus, RotateCcw, Send, ShieldCheck,
+  Trash2, X,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { Sheet } from "@/components/ui/dialog";
@@ -16,19 +17,22 @@ import { priority as priorityLabels, taskStatus, TASK_COLUMNS } from "@/lib/labe
 import type { ProfileLite, Task } from "@/lib/types";
 import { cn, dateTimeFr, relative } from "@/lib/utils";
 import {
-  addComment, addDependency, createTask, deleteTask, removeDependency, updateTask, type TaskPatch,
+  addComment, addDependency, createTask, deleteTask, removeDependency, reviewTask, submitTaskForReview, updateTask,
+  type TaskPatch,
 } from "@/app/(app)/projets/actions";
 
 type Comment = { id: string; body: string; created_at: string; author_id: string | null };
 type Dep = { depends_on_id: string; task: { id: string; title: string; status: Task["status"] } | null };
 
 export function TaskDrawer({
-  taskId, onClose, people, siblings = [],
+  taskId, onClose, people, siblings = [], assignableIds,
 }: {
   taskId: string | null;
   onClose: () => void;
   people: ProfileLite[];
   siblings?: { id: string; title: string }[];
+  /** Personnes a qui l'utilisateur peut confier une tache (lui-meme, son equipe). */
+  assignableIds?: string[];
 }) {
   const router = useRouter();
   const [task, setTask] = useState<Task | null>(null);
@@ -39,8 +43,15 @@ export function TaskDrawer({
   const [comment, setComment] = useState("");
   const [newSub, setNewSub] = useState("");
   const [depPick, setDepPick] = useState("");
+  const [me, setMe] = useState<string | null>(null);
+  const [reviewNote, setReviewNote] = useState("");
   const [pending, start] = useTransition();
   const pm = new Map(people.map((p) => [p.id, p]));
+  const assignable = assignableIds ? people.filter((p) => assignableIds.includes(p.id)) : people;
+
+  useEffect(() => {
+    createClient().auth.getUser().then(({ data }) => setMe(data.user?.id ?? null));
+  }, []);
 
   const load = useCallback(async (id: string) => {
     const supabase = createClient();
@@ -83,6 +94,45 @@ export function TaskDrawer({
 
   const blocked = deps.some((d) => d.task && d.task.status !== "done");
   const assignee = task?.assignee_id ? pm.get(task.assignee_id) : null;
+  const reviewer = task ? task.reviewer_id ?? task.reporter_id : null;
+  const isAssignee = Boolean(task && me && task.assignee_id === me);
+  const isReviewer = Boolean(task && me && reviewer === me);
+  const canSubmit = isAssignee && task?.status !== "done" && task?.status !== "review" && !blocked;
+  const awaitingReview = task?.status === "review";
+
+  function submit() {
+    if (!task) return;
+    start(async () => {
+      const r = await submitTaskForReview(task.id, reviewNote || undefined, task.project_id);
+      if (!r.ok) {
+        toast.error(r.error);
+        return;
+      }
+      toast.success(r.message);
+      setReviewNote("");
+      await load(task.id);
+      router.refresh();
+    });
+  }
+
+  function review(approve: boolean) {
+    if (!task) return;
+    if (!approve && reviewNote.trim().length < 3) {
+      toast.error("Indiquez ce qui doit etre repris.");
+      return;
+    }
+    start(async () => {
+      const r = await reviewTask(task.id, approve, reviewNote || undefined, task.project_id);
+      if (!r.ok) {
+        toast.error(r.error);
+        return;
+      }
+      toast.success(r.message);
+      setReviewNote("");
+      await load(task.id);
+      router.refresh();
+    });
+  }
 
   return (
     <Sheet open={Boolean(taskId)} onOpenChange={(o) => !o && onClose()} title={task ? "Détail de la tâche" : "Chargement…"} width="max-w-2xl">
@@ -108,6 +158,65 @@ export function TaskDrawer({
             </div>
           </div>
 
+          {(canSubmit || awaitingReview) && (
+            <div className="rounded-xl border border-border bg-surface-2/60 p-4">
+              {awaitingReview ? (
+                isReviewer ? (
+                  <>
+                    <p className="text-[13px] font-medium text-fg">
+                      {assignee?.full_name ?? "La personne en charge"} a soumis cette tâche à votre vérification.
+                    </p>
+                    <Textarea
+                      value={reviewNote}
+                      onChange={(e) => setReviewNote(e.target.value)}
+                      rows={2}
+                      className="mt-2.5"
+                      placeholder="Remarque, ou ce qui doit être repris en cas de renvoi…"
+                    />
+                    <div className="mt-2.5 flex flex-wrap gap-2">
+                      <Button size="sm" variant="success" loading={pending} onClick={() => review(true)}>
+                        <Check className="h-4 w-4" /> Valider la tâche
+                      </Button>
+                      <Button size="sm" variant="outline" loading={pending} onClick={() => review(false)}>
+                        <RotateCcw className="h-4 w-4" /> Renvoyer pour correction
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-[13px] text-muted">
+                    En attente de vérification par{" "}
+                    <span className="font-medium text-fg">{(reviewer && pm.get(reviewer)?.full_name) ?? "le responsable"}</span>.
+                  </p>
+                )
+              ) : (
+                <>
+                  <p className="text-[13px] font-medium text-fg">Travail terminé ?</p>
+                  <p className="mt-0.5 text-xs text-muted">
+                    {reviewer && reviewer !== me
+                      ? `${pm.get(reviewer)?.full_name ?? "La personne qui vous l'a confiée"} vérifiera avant clôture.`
+                      : "Cette tâche est la vôtre : la soumettre la termine directement."}
+                  </p>
+                  <Textarea
+                    value={reviewNote}
+                    onChange={(e) => setReviewNote(e.target.value)}
+                    rows={2}
+                    className="mt-2.5"
+                    placeholder="Ce que vous avez livré, un lien, un chiffre… (facultatif)"
+                  />
+                  <Button size="sm" className="mt-2.5" loading={pending} onClick={submit}>
+                    <Send className="h-4 w-4" /> Soumettre pour vérification
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
+
+          {task.review_note && !awaitingReview && (
+            <p className="rounded-xl bg-amber-500/10 px-4 py-3 text-[13px] text-fg">
+              <span className="font-medium">Retour de vérification : </span>{task.review_note}
+            </p>
+          )}
+
           <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
             <Prop label="Statut">
               <Select value={task.status} onChange={(e) => save({ status: e.target.value as Task["status"] })} disabled={pending}>
@@ -122,7 +231,10 @@ export function TaskDrawer({
             <Prop label="Assignée à">
               <Select value={task.assignee_id ?? ""} onChange={(e) => save({ assignee_id: e.target.value || null })}>
                 <option value="">— Non assignée —</option>
-                {people.map((p) => <option key={p.id} value={p.id}>{p.full_name}</option>)}
+                {assignable.map((p) => <option key={p.id} value={p.id}>{p.full_name}</option>)}
+                {task.assignee_id && !assignable.some((p) => p.id === task.assignee_id) && (
+                  <option value={task.assignee_id}>{pm.get(task.assignee_id)?.full_name ?? "Personne assignée"}</option>
+                )}
               </Select>
             </Prop>
             <Prop label="Échéance">
@@ -140,8 +252,8 @@ export function TaskDrawer({
           {task.project_id && (
             <label className="flex cursor-pointer items-center justify-between rounded-xl border border-border px-4 py-3">
               <span>
-                <span className="block text-sm font-medium text-fg">Validation par le responsable du projet</span>
-                <span className="block text-xs text-muted">La tâche passe « En revue » et ne peut être clôturée que par le responsable.</span>
+                <span className="block text-sm font-medium text-fg">Vérification avant clôture</span>
+                <span className="block text-xs text-muted">La tâche passe « En revue » et n&apos;est close que par la personne qui l&apos;a confiée.</span>
               </span>
               <input type="checkbox" checked={task.requires_validation} onChange={(e) => save({ requires_validation: e.target.checked })} className="h-4 w-4 accent-[var(--primary)]" />
             </label>

@@ -14,8 +14,8 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
   const { onglet = "profil" } = await searchParams;
   const ctx = await getContext();
   const supabase = await createClient();
-  const [{ data: factors }, { data: prefs }, { data: devices }] = await Promise.all([
-    supabase.auth.mfa.listFactors(),
+  const [{ data: hasCode }, { data: prefs }, { data: devices }] = await Promise.all([
+    onglet === "securite" ? supabase.rpc("has_access_code") : Promise.resolve({ data: null }),
     onglet === "notifications" ? supabase.from("notification_preferences").select("*").eq("profile_id", ctx.userId).maybeSingle() : Promise.resolve({ data: null }),
     onglet === "notifications" ? supabase.from("push_subscriptions").select("id, endpoint, device, created_at, last_used_at").order("created_at", { ascending: false }) : Promise.resolve({ data: null }),
   ]);
@@ -32,7 +32,7 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
           mailReady={mailerConfigured()}
         />
       ) : onglet === "securite" ? (
-        <SecuritySettings factors={(factors?.totp ?? []).map((f) => ({ id: f.id, name: f.friendly_name ?? "Application", status: f.status, created_at: f.created_at }))} email={ctx.email} />
+        <SecuritySettings hasCode={Boolean(hasCode)} email={ctx.email} />
       ) : (
         <ProfileSettings profile={ctx.profile} />
       )}

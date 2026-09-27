@@ -67,11 +67,23 @@ export async function canOnUnit(perm: string, unitId: string | null | undefined)
 }
 
 export function navAccess(ctx: AppContext) {
+  const operations = can(ctx, "ops.plan") || can(ctx, "ops.review") || can(ctx, "projects.admin") || can(ctx, "dashboard.exec");
+  const legal = can(ctx, "legal.view") || can(ctx, "legal.admin") || can(ctx, "dashboard.exec");
   return {
     direction: can(ctx, "dashboard.exec"),
     crm: canAnywhere(ctx, "crm.view") || canAnywhere(ctx, "crm.edit") || can(ctx, "dashboard.exec"),
     finance: can(ctx, "finance.view") || can(ctx, "finance.admin") || can(ctx, "dashboard.exec") || canAnywhere(ctx, "unit.manage"),
     hrAdmin: can(ctx, "hr.view") || can(ctx, "hr.admin"),
     admin: can(ctx, "users.admin") || can(ctx, "audit.view") || can(ctx, "grants.manage"),
+    operations,
+    legal,
+    // Le guichet des validations s'adresse à ceux qui décident et à ceux qui soumettent.
+    approvals: ctx.isCeo || can(ctx, "approvals.decide") || can(ctx, "finance.admin") || can(ctx, "legal.admin")
+      || can(ctx, "ops.plan") || canAnywhere(ctx, "unit.manage") || can(ctx, "hr.admin"),
   };
+}
+
+/** Peut décider des validations de la holding (le CEO, ou une délégation explicite). */
+export function canDecideApprovals(ctx: AppContext) {
+  return ctx.isCeo || can(ctx, "approvals.decide");
 }

@@ -18,7 +18,8 @@ export async function updateProfile(_: ActionResult | null, fd: FormData): Promi
   if (!id) return fail("Profil manquant.");
   const supabase = await createClient();
   const patch: Record<string, unknown> = {};
-  for (const k of ["first_name", "last_name", "job_title", "phone", "location", "bio", "birth_date"]) {
+  // L'intitulé de poste n'est plus saisi : il découle de la nomination (job_title_for).
+  for (const k of ["first_name", "last_name", "phone", "location", "bio", "birth_date"]) {
     if (fd.has(k)) patch[k] = str(fd, k) ?? (k === "first_name" || k === "last_name" ? "" : null);
   }
   for (const k of ["manager_id", "primary_unit_id", "hire_date", "system_role", "status"]) {

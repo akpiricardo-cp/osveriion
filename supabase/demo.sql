@@ -20,9 +20,9 @@ begin
 
   -- Budgets annuels par département
   for u in select id, code from public.org_units where depth = 1 loop
-    insert into public.budgets (unit_id, fiscal_year, amount)
+    insert into public.budgets (unit_id, fiscal_year, amount, status)
     values (u.id, y, case u.code when 'TECH' then 180000000 when 'MKT' then 90000000 when 'BIZ' then 60000000
-                                 when 'OPS' then 45000000 when 'FIN' then 30000000 else 40000000 end)
+                                 when 'OPS' then 45000000 when 'FIN' then 30000000 else 40000000 end, 'active')
     on conflict (unit_id, fiscal_year) do nothing;
   end loop;
 

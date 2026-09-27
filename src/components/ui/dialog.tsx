@@ -24,13 +24,16 @@ export function DialogContent({
       <D.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0" />
       <D.Content
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 flex max-h-[90vh] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col",
-          "rounded-2xl border border-border bg-surface shadow-2xl outline-none data-[state=open]:animate-in data-[state=open]:zoom-in-95 data-[state=open]:fade-in-0",
+          // Telephone : feuille ancree en bas, a portee du pouce. Ecran large : fenetre centree.
+          "fixed inset-x-0 bottom-0 z-50 flex max-h-[92vh] w-full flex-col rounded-t-2xl border border-border bg-surface shadow-2xl outline-none",
+          "data-[state=open]:animate-in data-[state=open]:slide-in-from-bottom data-[state=open]:fade-in-0",
+          "sm:inset-x-auto sm:bottom-auto sm:left-1/2 sm:top-1/2 sm:max-h-[90vh] sm:w-[calc(100vw-2rem)] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-2xl",
+          "sm:data-[state=open]:zoom-in-95 sm:data-[state=open]:slide-in-from-bottom-0",
           w,
           className,
         )}
       >
-        <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-4">
+        <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4 sm:px-6">
           <div>
             <D.Title className="text-base font-semibold tracking-tight text-fg">{title}</D.Title>
             {description ? (
@@ -43,7 +46,7 @@ export function DialogContent({
             <X className="h-4 w-4" />
           </D.Close>
         </div>
-        <div className="overflow-y-auto px-6 py-5">{children}</div>
+        <div className="overflow-y-auto px-5 py-5 pb-safe sm:px-6">{children}</div>
       </D.Content>
     </D.Portal>
   );
@@ -70,7 +73,7 @@ export function Sheet({
             width,
           )}
         >
-          <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-4">
+          <div className="flex items-start justify-between gap-4 border-b border-border px-5 pt-safe py-4 sm:px-6">
             <div className="min-w-0">
               <D.Title className="truncate text-base font-semibold tracking-tight text-fg">{title}</D.Title>
               <D.Description className={description ? "mt-1 text-[13px] text-muted" : "sr-only"}>
@@ -81,7 +84,7 @@ export function Sheet({
               <X className="h-4 w-4" />
             </D.Close>
           </div>
-          <div className="flex-1 overflow-y-auto">{children}</div>
+          <div className="flex-1 overflow-y-auto pb-safe">{children}</div>
         </D.Content>
       </D.Portal>
     </D.Root>

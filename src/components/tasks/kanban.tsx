@@ -24,13 +24,15 @@ const COLUMN_ACCENT: Record<TaskStatus, string> = {
 };
 
 export function ProjectBoard({
-  projectId, initialTasks, people, blockedIds, canContribute,
+  projectId, initialTasks, people, blockedIds, canContribute, assignableIds,
 }: {
   projectId: string;
   initialTasks: Task[];
   people: ProfileLite[];
   blockedIds: string[];
   canContribute: boolean;
+  /** Personnes a qui l'utilisateur peut confier une tache : son equipe, ou lui seul. */
+  assignableIds?: string[];
 }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -150,7 +152,13 @@ export function ProjectBoard({
         </div>
       )}
 
-      <TaskDrawer taskId={openId} onClose={() => open(null)} people={people} siblings={tasks.filter((t) => !t.parent_id).map((t) => ({ id: t.id, title: t.title }))} />
+      <TaskDrawer
+        taskId={openId}
+        onClose={() => open(null)}
+        people={people}
+        assignableIds={assignableIds}
+        siblings={tasks.filter((t) => !t.parent_id).map((t) => ({ id: t.id, title: t.title }))}
+      />
     </div>
   );
 }

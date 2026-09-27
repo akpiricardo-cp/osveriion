@@ -1,9 +1,10 @@
 import Link from "next/link";
 import {
-  AlarmClock, ArrowRight, CalendarDays, CheckCircle2, CheckSquare, Megaphone, Pin, ShieldAlert, Sparkles, Video,
+  AlarmClock, ArrowRight, CalendarDays, CheckCircle2, CheckSquare, Megaphone, Pin, ShieldCheck, Sparkles, Stamp,
+  Video,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
-import { can, getContext } from "@/lib/auth";
+import { can, canDecideApprovals, getContext } from "@/lib/auth";
 import { getPeople, getUnits, peopleMap, unitOptions } from "@/lib/data";
 import { priority, taskStatus } from "@/lib/labels";
 import { cn, dateFr, isOverdue, relative } from "@/lib/utils";
@@ -29,7 +30,7 @@ export default async function HomePage() {
   const in7 = new Date(now.getTime() + 7 * 86400000).toISOString();
   const today = now.toISOString().slice(0, 10);
 
-  const [tasksRes, meetingsRes, annRes, onboardingRes, leavesRes, factorsRes, people, units] = await Promise.all([
+  const [tasksRes, meetingsRes, annRes, onboardingRes, leavesRes, reviewRes, approvalRes, cycleRes, people, units] = await Promise.all([
     supabase.from("tasks").select("id, title, status, priority, due_date, project_id, projects(name, color)")
       .eq("assignee_id", ctx.userId).neq("status", "done").order("due_date", { ascending: true, nullsFirst: false }).limit(8),
     supabase.from("meetings").select("id, title, starts_at, ends_at, video_url, location")
@@ -37,7 +38,12 @@ export default async function HomePage() {
     supabase.from("announcements").select("*").order("pinned", { ascending: false }).order("published_at", { ascending: false }).limit(5),
     supabase.from("lifecycle_items").select("*").eq("profile_id", ctx.userId).eq("kind", "onboarding").order("position"),
     supabase.from("leave_requests").select("id", { count: "exact", head: true }).eq("status", "pending").neq("profile_id", ctx.userId),
-    supabase.auth.mfa.listFactors(),
+    supabase.from("tasks").select("id", { count: "exact", head: true })
+      .eq("status", "review").or(`reviewer_id.eq.${ctx.userId},reporter_id.eq.${ctx.userId}`),
+    supabase.from("approval_requests").select("id", { count: "exact", head: true }).eq("status", "pending"),
+    supabase.from("operation_cycles")
+      .select("id, title, focus, project_id, period_end, projects(name)")
+      .eq("status", "published").gte("period_end", today).order("period_start", { ascending: false }).limit(1),
     getPeople(),
     getUnits(),
   ]);
@@ -48,8 +54,11 @@ export default async function HomePage() {
   const announcements = annRes.data ?? [];
   const onboarding = onboardingRes.data ?? [];
   const pendingLeaves = leavesRes.count ?? 0;
+  const toReview = reviewRes.count ?? 0;
+  const toDecide = canDecideApprovals(ctx) ? approvalRes.count ?? 0 : 0;
+  const cycle = (cycleRes.data as unknown as
+    { id: string; title: string; focus: string | null; project_id: string; projects: { name: string } | null }[] | null)?.[0] ?? null;
   const pm = peopleMap(people);
-  const hasMfa = (factorsRes.data?.totp ?? []).some((f) => f.status === "verified");
   const overdue = tasks.filter((t) => isOverdue(t.due_date)).length;
   const dueToday = tasks.filter((t) => t.due_date === today).length;
   const onboardingDone = onboarding.filter((i) => i.done_at).length;
@@ -83,13 +92,47 @@ export default async function HomePage() {
         </div>
       </div>
 
-      {!hasMfa && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/[0.07] p-4 sm:flex-row sm:items-center">
-          <ShieldAlert className="h-5 w-5 shrink-0 text-amber-600" />
-          <p className="flex-1 text-sm text-fg">
-            <span className="font-medium">Sécurisez votre compte.</span> La double authentification n&apos;est pas encore activée.
-          </p>
-          <ButtonLink href="/mfa/activation" size="sm" variant="outline">Activer maintenant</ButtonLink>
+      {(toReview > 0 || toDecide > 0 || cycle) && (
+        <div className="flex flex-col gap-2 rounded-2xl border border-border bg-surface p-4 shadow-card sm:flex-row sm:items-center sm:gap-5">
+          {toReview > 0 && (
+            <Link href="/taches?onglet=verifier" className="group flex items-center gap-2.5 text-sm">
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber-500/10 text-amber-600">
+                <ShieldCheck className="h-4 w-4" />
+              </span>
+              <span>
+                <span className="block font-medium text-fg group-hover:underline">
+                  {toReview} tâche{toReview > 1 ? "s" : ""} à vérifier
+                </span>
+                <span className="block text-xs text-subtle">soumises par votre équipe</span>
+              </span>
+            </Link>
+          )}
+          {toDecide > 0 && (
+            <Link href="/validations" className="group flex items-center gap-2.5 text-sm">
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-violet-500/10 text-violet-600">
+                <Stamp className="h-4 w-4" />
+              </span>
+              <span>
+                <span className="block font-medium text-fg group-hover:underline">
+                  {toDecide} décision{toDecide > 1 ? "s" : ""} à trancher
+                </span>
+                <span className="block text-xs text-subtle">budgets, contrats, calendriers, projets</span>
+              </span>
+            </Link>
+          )}
+          {cycle && (
+            <Link href={`/projets/${cycle.project_id}?onglet=operations`} className="group flex min-w-0 items-center gap-2.5 text-sm sm:ml-auto">
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan-500/10 text-cyan-600">
+                <CalendarDays className="h-4 w-4" />
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate font-medium text-fg group-hover:underline">
+                  Cap en cours : {cycle.title}
+                </span>
+                <span className="block truncate text-xs text-subtle">{cycle.projects?.name ?? "Projet"}{cycle.focus ? ` — ${cycle.focus}` : ""}</span>
+              </span>
+            </Link>
+          )}
         </div>
       )}
 

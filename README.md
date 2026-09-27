@@ -24,11 +24,15 @@
 
 | Module | Fonctionnalités |
 | --- | --- |
-| **Identité & sécurité** | Connexion unique `prenom.nom@veriion.com`, double authentification TOTP obligatoire (configurable), mot de passe oublié, invitation par e-mail, sessions (déconnexion des autres appareils), suspension et départ d'un collaborateur |
-| **Organisation** | Organigramme interactif Entreprise → Département → Sous-département → Équipe, nomination datée des responsables et adjoints **avec historique**, page dédiée par unité (effectif, budget, objectifs, projets, canal, réunions) |
+| **Identité & sécurité** | Connexion unique `prenom.nom@veriion.com`, **code d'accès personnel** redemandé à chaque nouvelle session (sans jamais déconnecter), mot de passe oublié, invitation par e-mail, sessions (déconnexion des autres appareils), suspension et départ d'un collaborateur |
+| **Organisation (holding)** | Deux axes qui se croisent : l'**équipe administrative** (Direction Générale, Opérations, Technologie, Finance, Business, Marketing, Juridique, RH — CEO, COO, CTO, CFO, CBO, CMO…) et les **projets**, chacun dirigé par son **Chief Product**. Chaque département désigne un **référent par projet**, ajouté automatiquement au canal du projet. Organigramme interactif, nomination datée **avec historique**, **fusion de deux unités** (les membres, sous-unités, budgets, canaux et dossiers suivent), création/réduction de départements par le CEO |
+| **Intitulés de poste** | Plus aucune saisie libre : l'unité porte les intitulés (responsable, adjoint, membre) et la **nomination attribue le poste**. Diriger un projet donne l'intitulé *Chief Product — <projet>* |
+| **Calendrier opérationnel** | Le département des **Opérations** écrit le calendrier de chaque projet (**mensuel**, **hebdomadaire**, **journalier**) sous forme de grandes lignes avec résultat attendu. Le mensuel passe par l'accord du CEO avant publication. Le chef de projet les découpe en tâches, puis **rend compte** à chaque cycle (avancement, blocages, prochaines étapes) ; les Opérations accusent réception |
+| **Validations du CEO** | Guichet unique des décisions qui engagent la holding : **budgets et dépenses au-delà d'un seuil** (réglable), **contrats**, **calendriers mensuels**, **lancement de projet** et **contrats de travail**. Accord ou refus motivé, notifié au demandeur ; la base refuse l'opération tant que l'accord n'est pas donné |
+| **Juridique** | Registre des contrats de la holding (NDA, partenariat, client, fournisseur, licence, actes statutaires) : rédaction, revue juridique, signature du CEO, prise d'effet, échéance, **préavis de renouvellement** avec rappel automatique, niveau de risque, engagements à tenir |
 | **Droits automatiques** | Nommer quelqu'un responsable modifie **automatiquement** ses droits (règles configurables), dérogations manuelles temporaires et motivées |
 | **Communication** | Messagerie temps réel : conversations directes, canaux de groupe (publics/privés), canal par département et par projet, **fils de discussion**, **mentions @** avec autocomplétion et notification, **pièces jointes** (glisser-déposer, coller une capture, aperçu des images), **réactions**, **messages épinglés**, **recherche**, **appel vidéo en un clic** depuis la conversation, indicateur « est en train d'écrire », modification/suppression, non-lus, annonces de la direction |
-| **Projets & tâches** | Kanban glisser-déposer (souris et tactile), vue liste, sous-tâches, dépendances bloquantes, **circuit de validation**, commentaires, notifications, collaboration temps réel, « Mes tâches » par échéance |
+| **Projets & tâches** | Un projet = un Chief Product, une équipe, des référents. **Répartition hiérarchique** : on ne confie une tâche qu'à soi-même, à son équipe projet ou aux personnes que l'on encadre. Une tâche confiée par quelqu'un d'autre ne se clôt pas seule : son titulaire la **soumet à vérification**, et celui qui l'a confiée **valide ou la renvoie avec un motif**. Kanban glisser-déposer (souris et tactile), vue liste, sous-tâches, dépendances bloquantes, commentaires, temps réel, « Mes tâches » et « À vérifier » |
 | **CRM & partenariats** | Prospects/clients/partenaires, contacts, pipeline glisser-déposer, historique des interactions. **Une opportunité gagnée crée automatiquement le projet de livraison et la facture brouillon** |
 | **Finance** | Revenus, dépenses, trésorerie, factures (lignes, TVA, impression PDF), budgets par unité avec consommation, analyses par produit/pays/catégorie. **Une facture encaissée génère le revenu comptable** |
 | **RH** | Congés (solde, demande, validation par le responsable, notifications), contrats, salaires confidentiels, masse salariale, parcours d'intégration et de départ |
@@ -40,7 +44,9 @@
 | **Dashboard de direction** | Utilisateurs actifs, revenus, dépenses, trésorerie, pipeline, projets, tâches en retard, performance par département, incidents, objectifs |
 | **Administration** | Comptes, droits effectifs, règles automatiques, **journal d'activité immuable**, paramètres de l'entreprise |
 
-Recherche globale `Ctrl/⌘ + K`, thème clair/sombre, interface responsive (mobile, tablette, desktop), 100 % en français.
+Recherche globale `Ctrl/⌘ + K`, thème clair/sombre, **100 % en français**.
+
+**Pensé pour le téléphone d'abord** : barre de navigation basse à portée du pouce (Accueil, Tâches, Messages, Projets, et le reste en tiroir), boîtes de dialogue ancrées en bas de l'écran, champs de saisie à 16 px (pas de zoom intempestif sur iOS), zones de sécurité respectées sous l'encoche et la barre d'accueil, application installable sur l'écran d'accueil.
 
 ---
 
@@ -54,7 +60,7 @@ Next.js 15 (App Router) ── Server Components (lecture) ── Server Actions
         │                         middleware : rafraîchit la session, protège les routes
         ▼
 Supabase
- ├── Auth ............ identités, MFA TOTP, invitations
+ ├── Auth ............ identités, invitations
  ├── PostgreSQL ...... schéma métier + RLS sur 100 % des tables + triggers
  ├── Realtime ........ messages, notifications, tâches, co-édition (broadcast + présence)
  ├── Storage ......... documents, doc-assets (images des documents), chat (pièces jointes) — privés ; avatars (public)
@@ -72,6 +78,41 @@ Envoi hors plateforme : /api/notifications/dispatch (Next.js) → SMTP de veriio
 - Les triggers portent les règles métier (dépendances de tâches, validation, facture payée → revenu, opportunité gagnée → projet + facture, notifications, audit).
 
 Stack : Next.js 15 · React 19 · TypeScript strict · Tailwind CSS 4 · Radix UI · dnd-kit · Recharts · TipTap (éditeur de texte) · fast-formula-parser (formules) · docx / exceljs / pptxgenjs / mammoth (import-export Office) · Supabase (Postgres 15+).
+
+**Le modèle : une holding et ses projets.** VERIION pilote plusieurs produits ; l'organisation croise deux axes.
+
+```
+                         VERIION (holding) — CEO
+                                   │
+   ┌──────────┬──────────┬─────────┼─────────┬──────────┬──────────┬──────────┐
+  DG         OPS        TECH      FIN       BIZ        MKT        LEG        RH
+ (CEO)      (COO)      (CTO)     (CFO)     (CBO)      (CMO)   (Juridique)  (CHRO)
+   └──────────┴──────────┴─────────┴─────────┴──────────┴──────────┴──────────┘
+                    chaque département désigne UN RÉFÉRENT par projet
+                                   │
+              ┌────────────────────┼────────────────────┐
+           Projet A             Projet B             Projet C
+      Chief Product +      Chief Product +      Chief Product +
+          équipe               équipe               équipe
+```
+
+Le travail descend et remonte toujours par le même chemin :
+
+1. les **Opérations** écrivent le calendrier du projet (mensuel, hebdomadaire, journalier) ;
+2. le calendrier mensuel reçoit l'**accord du CEO**, puis est publié au projet ;
+3. le **Chief Product** découpe chaque grande ligne en **tâches** qu'il répartit dans son équipe, lui compris ;
+4. chaque membre **soumet** sa tâche terminée ; celui qui l'a confiée **vérifie** ;
+5. le Chief Product **rend compte** aux Opérations à la clôture du cycle.
+
+Les départements ne commandent pas les équipes : ils coordonnent par leur référent, qui est membre du canal du projet et voit son avancement.
+
+**Code d'accès personnel (verrou de session).** Chaque collaborateur choisit un code connu de lui seul, demandé à chaque nouvelle session du navigateur pour rouvrir son espace :
+
+- il remplace la double authentification TOTP, qui obligeait à ressortir son téléphone et cassait la session ;
+- **il ne déconnecte jamais** : la session Supabase reste ouverte, l'application est seulement verrouillée. Le code rouvre l'espace là où on l'avait laissé ;
+- seul un hachage bcrypt est conservé, dans une table `access_codes` sans aucune policy RLS ni droit de lecture : tout passe par `set_access_code`, `verify_access_code` et `has_access_code` ;
+- 5 échecs consécutifs bloquent la saisie 15 minutes ; un administrateur peut effacer un code oublié (*Administration > Comptes*), la personne en choisit alors un nouveau ;
+- une fois le code accepté, un cookie `httpOnly` signé (HMAC-SHA256, `ACCESS_CODE_SECRET`) déverrouille l'espace pour la session du navigateur — 12 heures au maximum. Le middleware le vérifie à chaque requête, y compris pour les Server Actions et les fichiers.
 
 Les fichiers privés ne sont jamais exposés par URL publique : ils passent par la route `/api/storage/<bucket>/…` qui les lit **avec la session de l'utilisateur**, donc sous les politiques RLS du stockage.
 
@@ -93,10 +134,10 @@ Créez le projet, choisissez une région proche (ex. `eu-west` ou `af-south` si 
 Dans **Supabase > SQL Editor > New query** :
 
 1. Collez le contenu de **`supabase/install.sql`** et cliquez **Run**.
-   Ce fichier regroupe, dans l'ordre, les 7 migrations et la structure de l'organisation (celle de votre organigramme : Direction Générale, Opérations, Technologie, Marketing, Business, Finance et leurs sous-unités).
+   Ce fichier regroupe, dans l'ordre, les 10 migrations et la structure de l'organisation (celle de votre organigramme : Direction Générale, Opérations, Technologie, Marketing, Business, Finance et leurs sous-unités).
 2. *(Optionnel)* Pour voir des tableaux de bord remplis pendant vos essais, exécutez **`supabase/demo.sql`** (données fictives : revenus, dépenses, CRM, métriques). Un bloc de nettoyage est fourni en bas du fichier.
 
-> **Vous aviez déjà exécuté une version précédente de `install.sql` ?** N'exécutez pas tout à nouveau : lancez seulement les migrations manquantes, dans l'ordre — depuis la version à 4 migrations : `20260926000005_drive.sql`, `20260926000006_messaging.sql` puis `20260927000007_collab_notifications.sql` ; depuis la version à 6 migrations : uniquement `20260927000007_collab_notifications.sql`. Vos documents existants sont rangés automatiquement dans l'espace *Documents de l'entreprise* ou dans celui de leur département / projet.
+> **Vous aviez déjà exécuté une version précédente de `install.sql` ?** N'exécutez pas tout à nouveau : lancez seulement les migrations manquantes, dans l'ordre — depuis la version à 4 migrations : `20260926000005_drive.sql`, `20260926000006_messaging.sql` puis `20260927000007_collab_notifications.sql` ; depuis la version à 6 migrations : `20260927000007_collab_notifications.sql` puis `20260928000008_access_code.sql` ; depuis la version à 7 migrations : `20260928000008_access_code.sql`, `20260929000009_holding.sql` puis `20260930000010_operations_legal.sql`. Les deux dernières ajoutent les départements **Juridique** et **Ressources Humaines** s'ils manquent, posent les intitulés des officiers (CEO, COO, CTO, CFO, CBO, CMO) et recalculent les droits de chacun — vos unités et vos nominations existantes sont conservées. **Ces deux migrations sont rejouables** : si une exécution s'interrompt, relancez le fichier entier sans risque (tout y est conditionné par `if not exists`, et les reprises de données ne s'appliquent qu'au premier passage). Vos documents existants sont rangés automatiquement dans l'espace *Documents de l'entreprise* ou dans celui de leur département / projet.
 
 > Vous préférez la CLI Supabase ? `supabase link --project-ref <ref>` puis `supabase db push` applique `supabase/migrations/` ; exécutez ensuite `supabase/seed.sql`.
 
@@ -113,7 +154,7 @@ Les buckets de stockage (`documents`, `doc-assets`, `chat`, `avatars`) et leurs 
 **Authentication > Sign In / Providers > Email**
 - Activez *Email*. Après avoir créé le compte du CEO (étape 4), **désactivez « Allow new users to sign up »** : les comptes ne seront plus créés que par invitation.
 
-**Authentication > Multi-Factor** : laissez *TOTP* activé.
+**Authentication > Multi-Factor** : rien à configurer. La double authentification TOTP n'est pas utilisée ; l'accès à l'espace est protégé par le **code d'accès personnel** que chaque collaborateur choisit lui-même (§ 4).
 
 **Authentication > Emails > Templates** — remplacez le lien des deux modèles suivants :
 
@@ -145,7 +186,7 @@ cp .env.example .env.local
 | `SUPABASE_SERVICE_ROLE_KEY` | Project Settings > API (service_role / secret) | **Serveur uniquement** : invitations et suspension de comptes |
 | `NEXT_PUBLIC_SITE_URL` | — | URL publique de l'application |
 | `NEXT_PUBLIC_EMAIL_DOMAIN` | — | `veriion.com` : seul domaine accepté pour les invitations |
-| `REQUIRE_MFA` | — | `true` : chaque employé doit activer la double authentification |
+| `ACCESS_CODE_SECRET` | 32 caractères aléatoires (`openssl rand -hex 16`) | Signe le verrou du code d'accès. Facultative (la clé `service_role` sert de repli) ; la changer redemande le code à tout le monde |
 | `NEXT_PUBLIC_MEET_BASE_URL` | — | Préfixe des salles de visioconférence (réunions et appels depuis la messagerie) : `https://meet.jit.si/veriion` ou votre propre serveur Jitsi |
 | `NEXT_PUBLIC_TIMEZONE` | — | `Africa/Porto-Novo` : fuseau d'affichage |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Votre messagerie (Google Workspace, Microsoft 365, Brevo…) | Envoi des e-mails de notification (voir § Notifications) |
@@ -177,10 +218,12 @@ npm run dev          # http://localhost:3000
 Le **premier compte créé devient automatiquement CEO** (accès global).
 
 1. Tant que les inscriptions sont ouvertes, créez votre compte depuis **Authentication > Users > Add user** (cochez *Auto Confirm User*) avec votre adresse `prenom.nom@veriion.com`.
-2. Connectez-vous sur `/connexion`, activez la double authentification.
+2. Connectez-vous sur `/connexion` : l'application vous demande de **créer votre code d'accès personnel** (6 à 32 caractères, redemandé à chaque nouvelle session sans jamais vous déconnecter), puis de **compléter votre profil** (prénom, nom, téléphone, localisation). Ces deux étapes valent pour chaque collaborateur.
 3. **Désactivez les inscriptions publiques** (étape 3).
-4. Dans **Organisation**, ouvrez *Direction Générale* → *Nommer le responsable* → vous-même, intitulé « CEO ».
-5. Dans **Administration > Comptes**, invitez vos directeurs en choisissant leur département et le rôle **Responsable** : leurs droits sont attribués automatiquement.
+4. Dans **Organisation**, nommez-vous responsable de **VERIION** : l'intitulé « CEO — Directeur Général » vous est attribué automatiquement (les intitulés se règlent sur chaque unité, plus dans la fiche des personnes).
+5. Dans **Administration > Comptes**, invitez vos officiers (COO, CTO, CFO, CBO, CMO, Juridique, RH) en choisissant leur département et le rôle **Responsable** : intitulé et droits suivent automatiquement.
+6. Créez votre premier **projet** dans *Projets*, désignez son **Chief Product**, puis, dans *Organisation > Projets & référents*, désignez le référent de chaque département pour ce projet.
+7. Demandez le **lancement du projet** depuis sa fiche : il passe actif dès votre accord dans *Validations*.
 
 ---
 
@@ -205,9 +248,16 @@ Le **premier compte créé devient automatiquement CEO** (accès global).
 | Business | Membre | Consulter et modifier le CRM |
 | Business | Responsable | Administrer le CRM |
 | Marketing | Responsable | Consulter le CRM |
-| RH | Membre / Adjoint | Consulter / administrer les RH |
-| Opérations | Responsable | Accès à tous les projets |
+| RH | Membre / Adjoint / Responsable | Consulter / administrer les RH (+ dashboard pour le CHRO) |
+| Opérations | Responsable / Adjoint | Écrire et publier les calendriers opérationnels (`ops.plan`), accès à tous les projets |
+| Opérations | Membre | Suivre les rapports des chefs de projet (`ops.review`) |
+| Juridique | Membre | Consulter le registre des contrats (`legal.view`) |
+| Juridique | Adjoint / Responsable | Administrer le registre, soumettre les contrats à signature (`legal.admin`) |
 | Technologie | Responsable | Métriques produit et incidents |
+
+**Décisions réservées au CEO** (`approvals.decide`, délégable par dérogation) : budgets et dépenses au-delà du seuil défini dans *Paramètres*, contrats juridiques, calendriers mensuels, lancement de projet et contrats de travail. Ce ne sont pas de simples écrans : la base **refuse** l'écriture tant que l'accord n'est pas enregistré.
+
+**Répartition des tâches** : `can_assign_task` autorise l'auto-assignation, le chef de projet vers les membres de son équipe, et un responsable vers les personnes qu'il encadre — rien d'autre. Une tâche confiée exige une vérification, et seul celui qui l'a confiée peut la clôturer.
 
 - Les droits **globaux** de responsable ne sont accordés qu'au niveau **département** ; un responsable de sous-unité administre son périmètre sans hériter des droits globaux du département.
 - Une nomination clôture l'affectation précédente (date de fin) : **l'historique n'est jamais effacé**.
@@ -243,7 +293,7 @@ Le **premier compte créé devient automatiquement CEO** (accès global).
 
 ### Check-list sécurité avant ouverture
 - [ ] Inscriptions publiques désactivées
-- [ ] `REQUIRE_MFA=true`
+- [ ] `ACCESS_CODE_SECRET` défini (32 caractères aléatoires) et conservé tel quel
 - [ ] SMTP professionnel configuré, modèles d'e-mail en français
 - [ ] Sauvegardes quotidiennes activées (plan Pro : Point-in-Time Recovery)
 - [ ] Clé `service_role` uniquement côté serveur
@@ -260,7 +310,7 @@ Le schéma SQL est livré avec des scénarios de test exécutables sur n'importe
 PGURL=postgresql://postgres@localhost:5432/postgres ./supabase/tests/run.sh
 ```
 
-Ils vérifient notamment : droits automatiques à la nomination, cloisonnement finance, impossibilité d'escalader son rôle, transfert de responsabilité avec historique, validation et dépendances des tâches, opportunité gagnée → projet + facture, facture payée → revenu, départ d'un employé, le bon fonctionnement de toutes les écritures sous RLS, et pour le Drive et la messagerie : espaces et droits par rôle, espace personnel inaccessible au CEO, lecteur/contributeur, conflit de révision, partage + notification, corbeille et restauration, blocage des déplacements hors périmètre, mentions, fils, épingles, réactions, conversations directes et recherche ; et pour la co-édition et les notifications : enregistrement et invalidation de l'état de co-édition, protection en écriture, préférences et appareils privés, files d'envoi réservées au serveur et sans doublon, résumé une fois par jour, rappels d'échéance, de retard et de réunion.
+Ils vérifient notamment : droits automatiques à la nomination, cloisonnement finance, impossibilité d'escalader son rôle, transfert de responsabilité avec historique, validation et dépendances des tâches, opportunité gagnée → projet + facture, facture payée → revenu, départ d'un employé, le bon fonctionnement de toutes les écritures sous RLS, et pour le Drive et la messagerie : espaces et droits par rôle, espace personnel inaccessible au CEO, lecteur/contributeur, conflit de révision, partage + notification, corbeille et restauration, blocage des déplacements hors périmètre, mentions, fils, épingles, réactions, conversations directes et recherche ; et pour la co-édition et les notifications : enregistrement et invalidation de l'état de co-édition, protection en écriture, préférences et appareils privés, files d'envoi réservées au serveur et sans doublon, résumé une fois par jour, rappels d'échéance, de retard et de réunion ; pour le code d'accès : codes trop faibles refusés, hachage illisible même par son propriétaire, blocage après 5 échecs (y compris par la porte du changement de code), réinitialisation réservée aux administrateurs et journalisée sans le hachage, code effacé au départ d'un collaborateur ; et pour la holding : intitulé attribué à la nomination, droits automatiques des domaines Opérations et Juridique, référent ajouté au canal du projet, lancement de projet et calendrier mensuel bloqués sans l'accord du CEO (refus non motivé rejeté), dépense au-dessus du seuil refusée sans accord, contrat non signable sans accord, assignation hors périmètre refusée, tâche non clôturable par son titulaire puis renvoyée et validée par son vérificateur, rapport de cycle et accusé de réception, fusion d'unités (sous-unités déplacées, unité absorbée archivée, fusion circulaire refusée).
 
 ```bash
 npm run typecheck    # TypeScript strict
@@ -283,6 +333,9 @@ supabase/
     …0005_drive.sql              dossiers, espaces, partages, contenus éditables, versions, corbeille, favoris
     …0006_messaging.sql          fils, mentions, réactions, épingles, appels, pièces jointes, recherche
     …0007_collab_notifications.sql  co-édition, préférences, push, e-mails, rappels
+    …0008_access_code.sql        code d'accès personnel (verrou de session)
+    …0009_holding.sql            départements de la holding, projets, référents, intitulés, fusion, profil obligatoire
+    …0010_operations_legal.sql   calendrier opérationnel, rapports, juridique, validations du CEO, tâches vérifiées
   notifications_schedule.sql     activation de l'envoi planifié (pg_cron + pg_net)
   seed.sql                       organigramme VERIION + référentiel KPI
   demo.sql                       données de démonstration (optionnel)
@@ -290,12 +343,13 @@ supabase/
 src/
   middleware.ts                  session & protection des routes
   app/
-    (auth)/                      connexion, mot de passe, double authentification
+    (auth)/                      connexion, mot de passe, code d'accès, complétion du profil
     (app)/                       application (layout avec navigation)
       page.tsx                   accueil
       direction/  organisation/  annuaire/  messages/  reunions/
-      projets/    taches/        objectifs/ documents/
-      crm/        finance/       rh/        admin/     parametres/
+      projets/    operations/    taches/    objectifs/ documents/
+      crm/        finance/       juridique/ validations/
+      rh/         admin/         parametres/
     auth/                        callbacks e-mail
       documents/d/[id]/          ouverture d'un document dans son éditeur
     api/storage/                 lecture sécurisée des fichiers privés

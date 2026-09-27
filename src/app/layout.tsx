@@ -15,6 +15,11 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
+  // L'application se déploie sous les encoches et la barre d'accueil : les
+  // écrans gèrent eux-mêmes leurs marges de sécurité.
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
   themeColor: [
     { media: "(prefers-color-scheme: light)", color: "#f5f6fa" },
     { media: "(prefers-color-scheme: dark)", color: "#050816" },

@@ -38,6 +38,9 @@ export function ProjectFormButton({ units, project, people }: { units: { id: str
           {project && <input type="hidden" name="id" value={project.id} />}
           <input type="hidden" name="color" value={color} />
           <Field label="Nom du projet" htmlFor="name" required><Input id="name" name="name" required defaultValue={project?.name} /></Field>
+          <Field label="Mission" htmlFor="mission" hint="Ce que ce produit change, en une phrase.">
+            <Input id="mission" name="mission" defaultValue={project?.mission ?? ""} placeholder="Donner à chaque école africaine un outil de gestion complet" />
+          </Field>
           <Field label="Description" htmlFor="description"><Textarea id="description" name="description" rows={3} defaultValue={project?.description ?? ""} /></Field>
           <div className="grid gap-4 sm:grid-cols-3">
             <Field label="Statut" htmlFor="status">
@@ -55,8 +58,14 @@ export function ProjectFormButton({ units, project, people }: { units: { id: str
             <Field label="Échéance" htmlFor="due_date"><Input id="due_date" name="due_date" type="date" defaultValue={project?.due_date ?? ""} /></Field>
             <Field label="Unité" htmlFor="unit_id"><UnitSelect units={units} name="unit_id" defaultValue={project?.unit_id} placeholder="— Transverse —" /></Field>
           </div>
-          {project && people && (
-            <Field label="Responsable du projet" htmlFor="owner_id"><PersonSelect people={people} name="owner_id" defaultValue={project.owner_id} required /></Field>
+          {people && (
+            <Field
+              label="Chief Product"
+              htmlFor="lead_id"
+              hint="Il dirige le projet, répartit les tâches et rend compte aux Opérations. Son intitulé de poste suit."
+            >
+              <PersonSelect people={people} name="lead_id" defaultValue={project?.lead_id ?? undefined} placeholder="— Vous-même —" />
+            </Field>
           )}
           <Field label="Couleur">
             <div className="flex flex-wrap gap-2">

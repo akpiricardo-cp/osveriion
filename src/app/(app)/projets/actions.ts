@@ -34,10 +34,12 @@ export async function createProject(_: ActionResult | null, fd: FormData): Promi
     budget: numVal(fd, "budget"),
     color: str(fd, "color") ?? "#4F46E5",
     owner_id: user!.id,
+    lead_id: str(fd, "lead_id") ?? user!.id,
+    mission: str(fd, "mission"),
   }).select("id").single();
   if (error) return fail(error);
   refresh();
-  return ok("Projet créé. Un canal de discussion dédié est disponible.", data);
+  return ok("Projet créé. Son canal et son espace documentaire sont ouverts ; le lancement demande l'accord du CEO.", data);
 }
 
 export async function updateProject(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
@@ -56,6 +58,8 @@ export async function updateProject(_: ActionResult | null, fd: FormData): Promi
     budget: numVal(fd, "budget"),
     color: str(fd, "color") ?? undefined,
     owner_id: str(fd, "owner_id") ?? undefined,
+    lead_id: str(fd, "lead_id") ?? undefined,
+    mission: str(fd, "mission"),
   }).eq("id", id);
   if (error) return fail(error);
   refresh(id);
@@ -160,4 +164,54 @@ export async function addComment(taskId: string, body: string): Promise<ActionRe
   const { error } = await supabase.from("task_comments").insert({ task_id: taskId, body: text, author_id: user!.id });
   if (error) return fail(error);
   return ok();
+}
+
+/** Soumet le lancement d'un projet à l'accord du CEO (il passera « actif »). */
+export async function requestProjectLaunch(id: string, justification?: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { data: project } = await supabase.from("projects").select("name, budget").eq("id", id).maybeSingle();
+  if (!project) return fail("Projet introuvable.");
+  const { error } = await supabase.rpc("request_approval", {
+    p_kind: "project",
+    p_subject: id,
+    p_label: `Lancement du projet « ${project.name} »`,
+    p_amount: project.budget,
+    p_justification: justification ?? null,
+    p_unit: null,
+    p_project: id,
+  });
+  if (error) return fail(error);
+  refresh(id);
+  revalidatePath("/validations");
+  return ok("Lancement soumis au CEO. Le projet passera actif dès son accord.");
+}
+
+/** Une fois l'accord donné, le projet entre en exécution. */
+export async function activateProject(id: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.from("projects").update({ status: "active" }).eq("id", id);
+  if (error) return fail(error);
+  refresh(id);
+  return ok("Projet lancé.");
+}
+
+/**
+ * Le titulaire soumet sa tâche à vérification. Une tâche qu'on s'est confiée
+ * à soi-même se termine directement : il n'y a personne à qui rendre compte.
+ */
+export async function submitTaskForReview(taskId: string, note?: string, projectId?: string | null): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.rpc("submit_task", { p_task: taskId, p_note: note ?? null });
+  if (error) return fail(error);
+  refresh(projectId);
+  return ok("Tâche soumise à vérification.");
+}
+
+/** Le vérificateur valide, ou renvoie la tâche avec ce qui doit être repris. */
+export async function reviewTask(taskId: string, approve: boolean, note?: string, projectId?: string | null): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.rpc("review_task", { p_task: taskId, p_approve: approve, p_note: note ?? null });
+  if (error) return fail(error);
+  refresh(projectId);
+  return ok(approve ? "Tâche validée." : "Tâche renvoyée à son auteur.");
 }

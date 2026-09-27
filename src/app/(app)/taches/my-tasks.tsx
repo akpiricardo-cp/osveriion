@@ -13,7 +13,7 @@ import { TaskDrawer } from "@/components/tasks/task-drawer";
 import { priority, taskStatus } from "@/lib/labels";
 import type { ProfileLite, Task } from "@/lib/types";
 import { cn, dateFr, todayISO } from "@/lib/utils";
-import { createTask, updateTask } from "../projets/actions";
+import { createTask, submitTaskForReview, updateTask } from "../projets/actions";
 
 type Row = Task & { projects: { name: string; color: string } | null };
 
@@ -101,14 +101,21 @@ export function MyTasks({ tasks, people, mode }: { tasks: Row[]; people: Profile
               return (
                 <li key={t.id} className="flex items-center gap-3 px-4 py-3 transition hover:bg-surface-2/50">
                   <button
-                    aria-label="Terminer"
+                    aria-label={t.requires_validation && t.status !== "done" ? "Soumettre à vérification" : "Terminer"}
+                    title={t.requires_validation && t.status !== "done" ? "Soumettre à vérification" : "Terminer"}
                     onClick={() => start(async () => {
                       setDone((s) => new Set(s).add(t.id));
-                      const r = await updateTask(t.id, { status: t.status === "done" ? "todo" : "done" }, t.project_id);
+                      // Une tâche confiée par quelqu'un d'autre ne se clot pas seule : elle se soumet.
+                      const r = t.requires_validation && t.status !== "done"
+                        ? await submitTaskForReview(t.id, undefined, t.project_id)
+                        : await updateTask(t.id, { status: t.status === "done" ? "todo" : "done" }, t.project_id);
                       if (!r.ok) {
                         setDone((s) => { const n = new Set(s); n.delete(t.id); return n; });
                         toast.error(r.error);
-                      } else router.refresh();
+                      } else {
+                        if (r.message) toast.success(r.message);
+                        router.refresh();
+                      }
                     })}
                     className={cn("grid h-5 w-5 shrink-0 place-items-center rounded-full border-2 transition", isDone ? "border-emerald-500 bg-emerald-500 text-white" : "border-border hover:border-emerald-500")}
                   >

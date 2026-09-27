@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { KeyRound, MoreHorizontal, Plus, ShieldOff, UserCheck, UserMinus, UserPlus, X } from "lucide-react";
+import { KeyRound, Lock, MoreHorizontal, Plus, ShieldOff, UserCheck, UserMinus, UserPlus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTrigger } from "@/components/ui/dialog";
@@ -11,7 +11,7 @@ import { Checkbox, Field, Input, Select, Textarea } from "@/components/ui/input"
 import { PersonSelect, UnitSelect } from "@/components/pickers";
 import { membershipRole, systemRole, unitDomain } from "@/lib/labels";
 import type { ProfileLite } from "@/lib/types";
-import { addTemplate, grantException, inviteUser, offboardUser, removeTemplate, revokeGrant, sendPasswordReset, setUserStatus } from "./actions";
+import { addTemplate, grantException, inviteUser, offboardUser, removeTemplate, resetAccessCode, revokeGrant, sendPasswordReset, setUserStatus } from "./actions";
 
 export function InviteButton({ units, people, isCeo }: { units: { id: string; label: string }[]; people: ProfileLite[]; isCeo: boolean }) {
   const [open, setOpen] = useState(false);
@@ -57,6 +57,7 @@ export function UserMenu({ id, email, status, self }: { id: string; email: strin
       <DropdownTrigger disabled={pending} className="rounded-md p-1.5 text-subtle hover:bg-surface-2 hover:text-fg" aria-label="Actions"><MoreHorizontal className="h-4 w-4" /></DropdownTrigger>
       <DropdownContent>
         <DropdownItem onSelect={() => run(() => sendPasswordReset(email))}><KeyRound className="h-4 w-4 text-subtle" /> Réinitialiser le mot de passe</DropdownItem>
+        <DropdownItem onSelect={() => run(() => resetAccessCode(id), "Effacer le code d'accès de cette personne ? Elle en choisira un nouveau à sa prochaine ouverture.")}><Lock className="h-4 w-4 text-subtle" /> Réinitialiser le code d&apos;accès</DropdownItem>
         {status === "active" && <DropdownItem onSelect={() => run(() => setUserStatus(id, "suspended"), "Suspendre ce compte ? La personne ne pourra plus se connecter.")}><ShieldOff className="h-4 w-4 text-subtle" /> Suspendre</DropdownItem>}
         {status === "suspended" && <DropdownItem onSelect={() => run(() => setUserStatus(id, "active"))}><UserCheck className="h-4 w-4 text-subtle" /> Réactiver</DropdownItem>}
         {status !== "offboarded" && (

@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Archive, Pencil, Plus, UserPlus } from "lucide-react";
+import { Archive, Merge, Pencil, Plus, UserPlus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTrigger } from "@/components/ui/dialog";
@@ -12,7 +12,7 @@ import { PersonSelect, UnitSelect } from "@/components/pickers";
 import { membershipRole, unitDomain, unitKind } from "@/lib/labels";
 import type { OrgUnit, ProfileLite } from "@/lib/types";
 import { cn, todayISO } from "@/lib/utils";
-import { appointMember, archiveUnit, createUnit, updateUnit } from "./actions";
+import { appointMember, archiveUnit, createUnit, mergeUnits, updateUnit } from "./actions";
 
 const COLORS = ["#0B1F3A", "#0E7490", "#4F46E5", "#7C3AED", "#DB2777", "#EA580C", "#D97706", "#059669", "#0284C7", "#475569"];
 
@@ -55,6 +55,23 @@ function UnitFields({ unit, units, parentId }: { unit?: OrgUnit; units: { id: st
       </Field>
       <Field label="Couleur"><ColorPicker defaultValue={unit?.color} /></Field>
       <Field label="Mission" htmlFor="description"><Textarea id="description" name="description" rows={3} defaultValue={unit?.description ?? ""} /></Field>
+      <fieldset className="rounded-xl border border-border p-4">
+        <legend className="px-1 text-[13px] font-medium text-fg">Intitulés de poste</legend>
+        <p className="mb-3 text-xs text-subtle">
+          Attribués automatiquement à la nomination : personne ne saisit son titre.
+        </p>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field label="Responsable" htmlFor="head_title">
+            <Input id="head_title" name="head_title" defaultValue={unit?.head_title ?? ""} placeholder="CFO — Directeur Financier" />
+          </Field>
+          <Field label="Adjoint" htmlFor="deputy_title">
+            <Input id="deputy_title" name="deputy_title" defaultValue={unit?.deputy_title ?? ""} placeholder="Responsable Financier" />
+          </Field>
+          <Field label="Membre" htmlFor="member_title">
+            <Input id="member_title" name="member_title" defaultValue={unit?.member_title ?? ""} placeholder="Chargé de gestion" />
+          </Field>
+        </div>
+      </fieldset>
     </>
   );
 }
@@ -135,8 +152,63 @@ export function AppointButton({
             </Field>
             <Field label="À partir du" htmlFor="start_date"><Input id="start_date" name="start_date" type="date" defaultValue={todayISO()} /></Field>
           </div>
-          <Field label="Intitulé du poste" htmlFor="title" hint="Ex. : CMO, Lead Backend, Chargé d'acquisition"><Input id="title" name="title" /></Field>
+          <Field label="Intitulé du poste" htmlFor="title" hint="Laissez vide : l'intitulé défini sur l'unité est appliqué automatiquement.">
+            <Input id="title" name="title" placeholder="Automatique" />
+          </Field>
         </ActionForm>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Fusionner deux unités : réduire l'organisation sans rien perdre. Les membres,
+ * sous-unités, budgets, canaux et dossiers rejoignent l'unité d'accueil ;
+ * l'unité absorbée est archivée, son histoire reste lisible.
+ */
+export function MergeUnitButton({ unit, units }: { unit: OrgUnit; units: { id: string; label: string }[] }) {
+  const [open, setOpen] = useState(false);
+  const [target, setTarget] = useState("");
+  const [pending, start] = useTransition();
+  const router = useRouter();
+  const choices = units.filter((u) => u.id !== unit.id);
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm" variant="ghost"><Merge className="h-4 w-4" /> Fusionner</Button>
+      </DialogTrigger>
+      <DialogContent
+        title={`Fusionner « ${unit.name} »`}
+        description="Les membres, sous-unités, budgets, canaux et dossiers rejoignent l'unité d'accueil. L'unité fusionnée est archivée : nominations et journal restent consultables."
+      >
+        <Field label="Unité d'accueil" htmlFor="target" required>
+          <Select id="target" value={target} onChange={(e) => setTarget(e.target.value)}>
+            <option value="" disabled>Choisir l&apos;unité qui reprend l&apos;activité</option>
+            {choices.map((u) => <option key={u.id} value={u.id}>{u.label}</option>)}
+          </Select>
+        </Field>
+        <p className="mt-3 rounded-lg bg-amber-500/10 px-3 py-2 text-[13px] text-fg">
+          Un responsable qui arrive sur un poste déjà occupé devient <span className="font-medium">adjoint</span> ;
+          les budgets du même exercice sont additionnés.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="ghost" onClick={() => setOpen(false)}>Annuler</Button>
+          <Button
+            variant="danger"
+            disabled={!target}
+            loading={pending}
+            onClick={() => start(async () => {
+              const r = await mergeUnits(unit.id, target);
+              if (!r.ok) { toast.error(r.error); return; }
+              toast.success(r.message);
+              setOpen(false);
+              router.push(`/organisation/${target}`);
+            })}
+          >
+            Fusionner
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );

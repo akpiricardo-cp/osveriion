@@ -1,6 +1,7 @@
 import type {
-  AccountType, DocCategory, DocClassification, InvoiceStatus, LeaveType, MembershipRole, ObjectiveStatus,
-  OpportunityStage, Priority, ProjectStatus, RequestStatus, SystemRole, TaskStatus, UnitDomain, UnitKind,
+  AccountType, ApprovalKind, ApprovalStatus, CycleKind, CycleStatus, DocCategory, DocClassification, InvoiceStatus,
+  LeaveType, LegalContractStatus, LegalContractType, MembershipRole, ObjectiveStatus, OpportunityStage, OpsItemStatus,
+  Priority, ProjectStatus, RequestStatus, SystemRole, TaskStatus, UnitDomain, UnitKind,
 } from "./types";
 
 export type Tone = "neutral" | "blue" | "green" | "amber" | "red" | "violet" | "cyan" | "pink";
@@ -105,9 +106,11 @@ export const unitDomain: Record<UnitDomain, string> = {
   direction: "Direction",
   operations: "Opérations",
   technology: "Technologie",
+  product: "Produit",
   marketing: "Marketing",
   business: "Business",
   finance: "Finance",
+  legal: "Juridique",
   hr: "Ressources humaines",
   other: "Autre",
 };
@@ -152,3 +155,69 @@ export const EXPENSE_CATEGORIES = [
   "Matériel", "Prestataires", "Formation", "Frais bancaires", "Taxes", "Autre",
 ];
 export const REVENUE_CATEGORIES = ["Ventes", "Abonnements", "Services", "Subventions", "Partenariats", "Autre"];
+
+// ── Holding : validations, calendrier opérationnel, juridique ──────────────
+
+export const approvalKind: Record<ApprovalKind, string> = {
+  budget: "Budget",
+  expense: "Dépense",
+  legal_contract: "Contrat",
+  operation_cycle: "Calendrier opérationnel",
+  project: "Lancement de projet",
+  employment_contract: "Contrat de travail",
+  other: "Autre décision",
+};
+
+export const approvalStatus: Labeled<ApprovalStatus> = {
+  pending: { label: "En attente du CEO", tone: "amber" },
+  approved: { label: "Approuvée", tone: "green" },
+  rejected: { label: "Refusée", tone: "red" },
+  cancelled: { label: "Annulée", tone: "neutral" },
+};
+
+export const cycleKind: Record<CycleKind, string> = {
+  monthly: "Mensuel",
+  weekly: "Hebdomadaire",
+  daily: "Journalier",
+};
+
+export const cycleStatus: Labeled<CycleStatus> = {
+  draft: { label: "Brouillon", tone: "neutral" },
+  pending_ceo: { label: "Chez le CEO", tone: "amber" },
+  published: { label: "Publié", tone: "green" },
+  closed: { label: "Clôturé", tone: "blue" },
+};
+
+export const opsItemStatus: Labeled<OpsItemStatus> = {
+  planned: { label: "Prévu", tone: "neutral" },
+  in_progress: { label: "En cours", tone: "violet" },
+  done: { label: "Atteint", tone: "green" },
+  dropped: { label: "Abandonné", tone: "red" },
+};
+
+export const legalContractType: Record<LegalContractType, string> = {
+  nda: "Accord de confidentialité",
+  partnership: "Partenariat",
+  client: "Client",
+  supplier: "Fournisseur",
+  licence: "Licence",
+  employment: "Contrat de travail",
+  statutory: "Acte statutaire",
+  other: "Autre",
+};
+
+export const legalContractStatus: Labeled<LegalContractStatus> = {
+  draft: { label: "Brouillon", tone: "neutral" },
+  legal_review: { label: "Revue juridique", tone: "blue" },
+  pending_ceo: { label: "Chez le CEO", tone: "amber" },
+  signed: { label: "Signé", tone: "green" },
+  active: { label: "En vigueur", tone: "green" },
+  expired: { label: "Échu", tone: "red" },
+  terminated: { label: "Résilié", tone: "neutral" },
+};
+
+export const contractRisk: Labeled<"low" | "medium" | "high"> = {
+  low: { label: "Risque faible", tone: "green" },
+  medium: { label: "Risque moyen", tone: "amber" },
+  high: { label: "Risque élevé", tone: "red" },
+};

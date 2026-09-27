@@ -14,7 +14,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { Badge, LabelBadge } from "@/components/ui/badge";
 import { ButtonLink } from "@/components/ui/button";
 import { EmptyState, PageHeader, Progress, StatCard } from "@/components/ui/misc";
-import { AppointButton, ArchiveUnitButton, CreateUnitButton, EditUnitButton } from "../unit-forms";
+import { AppointButton, ArchiveUnitButton, CreateUnitButton, EditUnitButton, MergeUnitButton } from "../unit-forms";
 import { EndMembershipButton } from "./member-actions";
 
 export default async function UnitPage({ params }: { params: Promise<{ id: string }> }) {
@@ -73,6 +73,7 @@ export default async function UnitPage({ params }: { params: Promise<{ id: strin
             {channelRes.data && <ButtonLink href={`/messages/${channelRes.data.id}`} size="sm" variant="outline"><MessagesSquare className="h-4 w-4" /> Canal</ButtonLink>}
             {manage && <EditUnitButton unit={unit} units={unitOptions(units)} canRestructure={orgManage || canManageParent} />}
             {manage && <CreateUnitButton units={unitOptions(units)} parentId={unit.id} label="Sous-unité" />}
+            {orgManage && unit.kind !== "company" && <MergeUnitButton unit={unit} units={unitOptions(units)} />}
             {orgManage && unit.kind !== "company" && <ArchiveUnitButton id={unit.id} />}
           </>
         }

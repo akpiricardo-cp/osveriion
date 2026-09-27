@@ -71,34 +71,6 @@ end $$;
 grant execute on function public.has_access_code(uuid) to authenticated;
 
 -- -----------------------------------------------------------------------------
--- Définir ou changer son code. Le changement exige le code actuel.
--- -----------------------------------------------------------------------------
-create or replace function public.set_access_code(p_code text, p_current text default null)
-returns void language plpgsql security definer set search_path = public as $$
-declare existing public.access_codes;
-begin
-  if auth.uid() is null then raise exception 'Non connecté' using errcode = '42501'; end if;
-  if not public.is_active_user() then raise exception 'Compte inactif' using errcode = '42501'; end if;
-  if not public.access_code_valid(p_code) then
-    raise exception 'Le code doit contenir de 6 à 32 caractères, sans espace, et ne pas être un caractère répété ni une suite évidente.';
-  end if;
-  select * into existing from public.access_codes where profile_id = auth.uid() for update;
-  if existing.profile_id is not null then
-    if p_current is null or existing.code_hash <> extensions.crypt(p_current, existing.code_hash) then
-      raise exception 'Code actuel incorrect.' using errcode = '42501';
-    end if;
-    update public.access_codes
-       set code_hash = extensions.crypt(p_code, extensions.gen_salt('bf', 10)),
-           attempts = 0, locked_until = null, last_unlock_at = now()
-     where profile_id = auth.uid();
-  else
-    insert into public.access_codes (profile_id, code_hash, last_unlock_at)
-    values (auth.uid(), extensions.crypt(p_code, extensions.gen_salt('bf', 10)), now());
-  end if;
-end $$;
-grant execute on function public.set_access_code(text, text) to authenticated;
-
--- -----------------------------------------------------------------------------
 -- Vérifier son code pour rouvrir son espace.
 -- Retourne { ok:true } ou { ok:false, remaining } / { ok:false, locked_until } /
 -- { ok:false, missing:true } si aucun code n'est encore défini.
@@ -134,6 +106,40 @@ begin
   return jsonb_build_object('ok', false, 'remaining', remaining);
 end $$;
 grant execute on function public.verify_access_code(text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Définir ou changer son code. Le changement exige le code actuel, vérifié par
+-- `verify_access_code` : le changement de code est donc soumis au même compteur
+-- d'échecs et au même blocage temporaire que le déverrouillage.
+-- -----------------------------------------------------------------------------
+create or replace function public.set_access_code(p_code text, p_current text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare existing public.access_codes; verdict jsonb;
+begin
+  if auth.uid() is null then raise exception 'Non connecté' using errcode = '42501'; end if;
+  if not public.is_active_user() then raise exception 'Compte inactif' using errcode = '42501'; end if;
+  if not public.access_code_valid(p_code) then
+    raise exception 'Le code doit contenir de 6 à 32 caractères, sans espace, et ne pas être un caractère répété ni une suite évidente.';
+  end if;
+  select * into existing from public.access_codes where profile_id = auth.uid();
+  if existing.profile_id is not null then
+    verdict := public.verify_access_code(p_current);
+    if not coalesce((verdict->>'ok')::boolean, false) then
+      if verdict ? 'locked_until' then
+        raise exception 'Trop de tentatives. Réessayez dans quelques minutes ou demandez une réinitialisation à l''administration.' using errcode = '42501';
+      end if;
+      raise exception 'Code actuel incorrect.' using errcode = '42501';
+    end if;
+    update public.access_codes
+       set code_hash = extensions.crypt(p_code, extensions.gen_salt('bf', 10)),
+           attempts = 0, locked_until = null, last_unlock_at = now()
+     where profile_id = auth.uid();
+  else
+    insert into public.access_codes (profile_id, code_hash, last_unlock_at)
+    values (auth.uid(), extensions.crypt(p_code, extensions.gen_salt('bf', 10)), now());
+  end if;
+end $$;
+grant execute on function public.set_access_code(text, text) to authenticated;
 
 -- -----------------------------------------------------------------------------
 -- Code oublié : un administrateur l'efface, la personne en redéfinit un à sa

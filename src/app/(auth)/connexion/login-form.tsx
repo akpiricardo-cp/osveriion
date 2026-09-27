@@ -37,13 +37,9 @@ export function LoginForm() {
       setError(error.message === "Invalid login credentials" ? "Identifiants incorrects." : error.message);
       return;
     }
-    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-    const next = params.get("suite") || "/";
-    if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
-      router.replace(`/mfa?suite=${encodeURIComponent(next)}`);
-    } else {
-      router.replace(next);
-    }
+    // L'espace s'ouvre après la saisie du code d'accès personnel (écran /verrou,
+    // imposé par le middleware tant que la session n'est pas déverrouillée).
+    router.replace(params.get("suite") || "/");
     router.refresh();
   }
 

@@ -33,7 +33,7 @@ export function EditProfileButton({
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Prénom" htmlFor="first_name"><Input id="first_name" name="first_name" defaultValue={p.first_name} required /></Field>
             <Field label="Nom" htmlFor="last_name"><Input id="last_name" name="last_name" defaultValue={p.last_name} /></Field>
-            <Field label="Intitulé de poste" htmlFor="job_title"><Input id="job_title" name="job_title" defaultValue={p.job_title ?? ""} /></Field>
+            <Field label="Intitulé de poste" htmlFor="job_title" hint="Découle de la nomination dans l'organigramme."><Input id="job_title" value={p.job_title ?? "—"} disabled /></Field>
             <Field label="Téléphone" htmlFor="phone"><Input id="phone" name="phone" defaultValue={p.phone ?? ""} placeholder="+229 …" /></Field>
             <Field label="Localisation" htmlFor="location"><Input id="location" name="location" defaultValue={p.location ?? ""} placeholder="Cotonou" /></Field>
             <Field label="Date de naissance" htmlFor="birth_date"><Input id="birth_date" name="birth_date" type="date" defaultValue={p.birth_date ?? ""} /></Field>

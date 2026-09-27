@@ -6,7 +6,7 @@ import * as D from "@radix-ui/react-dialog";
 import { useTheme } from "next-themes";
 import { LogOut, Menu, Monitor, Moon, Settings, ShieldCheck, Sun, User } from "lucide-react";
 import { Avatar } from "@/components/ui/avatar";
-import { createClient } from "@/lib/supabase/client";
+import { logout } from "@/lib/logout";
 import { Dropdown, DropdownContent, DropdownItem, DropdownLabel, DropdownSeparator, DropdownTrigger } from "@/components/ui/dropdown";
 import { CommandSearch } from "./command-search";
 import { NotificationsBell } from "./notifications";
@@ -24,7 +24,7 @@ export function Topbar({
   const { setTheme } = useTheme();
 
   return (
-    <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-border bg-surface/85 px-4 backdrop-blur-xl sm:px-6">
+    <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-border bg-surface/85 px-3 pt-safe backdrop-blur-xl sm:h-16 sm:gap-3 sm:px-6">
       <D.Root open={mobileOpen} onOpenChange={setMobileOpen}>
         <D.Trigger className="grid h-9 w-9 place-items-center rounded-lg text-muted hover:bg-surface-2 lg:hidden" aria-label="Menu">
           <Menu className="h-5 w-5" />
@@ -72,10 +72,7 @@ export function Topbar({
             <DropdownSeparator />
             <DropdownItem
               danger
-              onSelect={async () => {
-                await createClient().auth.signOut();
-                window.location.href = "/connexion";
-              }}
+              onSelect={() => { void logout(); }}
             >
               <LogOut className="h-4 w-4" /> Se déconnecter
             </DropdownItem>
