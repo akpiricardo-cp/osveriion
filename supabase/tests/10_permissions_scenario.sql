@@ -81,7 +81,7 @@ reset role;
 -- ===== CMO approuve le congé (responsable du Marketing, développeur dans MKT-ACQ)
 select pg_temp.as_user('00000000-0000-0000-0000-00000000000c');
 select count(*) as cmo_sees_leave from leave_requests;
-update leave_requests set status='approved', decision_note='Bon repos' where status='pending';
+select public.decide_approval((select id from approval_requests where kind = 'leave' and status = 'pending'), true, 'Bon repos');
 select name, unread from public.my_channels() where kind='direct';
 reset role;
 select status, approver_id is not null as has_approver from leave_requests;
