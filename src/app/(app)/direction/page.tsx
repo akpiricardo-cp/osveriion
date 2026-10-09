@@ -62,7 +62,7 @@ export default async function DirectionPage({ searchParams }: { searchParams: Pr
       />
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatCard label="Utilisateurs actifs" value={num(k.active_users, true)} icon={Users} trend={{ value: trend(k.active_users, k.active_users_prev), label: "vs il y a 30 j" }} />
+        <StatCard label="Utilisateurs des plateformes" value={num(k.active_users, true)} icon={Users} trend={{ value: trend(k.active_users, k.active_users_prev), label: "vs il y a 30 j" }} />
         <StatCard label="Revenus cumulés" value={money(k.revenue_ytd, "XOF", true)} icon={TrendingUp} tone="green" href="/finance" trend={k.revenue_prev ? { value: trend(k.revenue_ytd, k.revenue_prev), label: "vs N-1 même date" } : undefined} hint={k.revenue_prev ? undefined : "depuis le 1er janvier"} />
         <StatCard label="Dépenses cumulées" value={money(k.expense_ytd, "XOF", true)} icon={TrendingDown} tone="amber" href="/finance?onglet=operations" hint={k.revenue_ytd ? `marge ${Math.round(((k.revenue_ytd - k.expense_ytd) / k.revenue_ytd) * 100)} %` : undefined} />
         <StatCard label="Trésorerie" value={money(k.cash, "XOF", true)} icon={Landmark} tone={k.cash >= 0 ? "cyan" : "red"} hint={`${money(k.receivables, "XOF", true)} à encaisser`} />
@@ -78,7 +78,7 @@ export default async function DirectionPage({ searchParams }: { searchParams: Pr
           <div className="p-5 pt-3"><RevenueExpenseChart data={d.monthly} /></div>
         </Card>
         <Card>
-          <CardHeader title="Utilisateurs actifs" description="90 derniers jours, tous produits" icon={<Users className="h-4 w-4" />} />
+          <CardHeader title="Utilisateurs des plateformes" description="90 derniers jours, tous produits — saisie manuelle des métriques produit" icon={<Users className="h-4 w-4" />} />
           <div className="p-5 pt-3">
             {d.active_users_series.length ? <TrendChart data={d.active_users_series} label="Utilisateurs actifs" /> : <p className="py-16 text-center text-sm text-muted">Aucune métrique produit enregistrée.</p>}
             <p className="mt-2 text-xs text-subtle">{num(k.new_users_30d)} nouveaux utilisateurs sur 30 jours.</p>

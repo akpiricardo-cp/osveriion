@@ -2,7 +2,9 @@ import { createClient } from "@/lib/supabase/server";
 import { getContext } from "@/lib/auth";
 import { PageHeader } from "@/components/ui/misc";
 import { LinkTabs } from "@/components/ui/tabs";
-import { ProfileSettings, SecuritySettings } from "./settings-client";
+import { GovernanceSettings, ProfileSettings, SecuritySettings } from "./settings-client";
+import { getPeople } from "@/lib/data";
+import type { GovernanceSettings as Governance } from "@/lib/types";
 import { NotificationSettings } from "./notification-settings";
 import { DEFAULT_PREFERENCES, type NotificationPreferences } from "@/lib/notifications";
 import { mailerConfigured } from "@/lib/server/mailer";
@@ -14,16 +16,22 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
   const { onglet = "profil" } = await searchParams;
   const ctx = await getContext();
   const supabase = await createClient();
-  const [{ data: hasCode }, { data: prefs }, { data: devices }] = await Promise.all([
+  const [{ data: hasCode }, { data: prefs }, { data: devices }, { data: governance }, people] = await Promise.all([
     onglet === "securite" ? supabase.rpc("has_access_code") : Promise.resolve({ data: null }),
     onglet === "notifications" ? supabase.from("notification_preferences").select("*").eq("profile_id", ctx.userId).maybeSingle() : Promise.resolve({ data: null }),
     onglet === "notifications" ? supabase.from("push_subscriptions").select("id, endpoint, device, created_at, last_used_at").order("created_at", { ascending: false }) : Promise.resolve({ data: null }),
+    onglet === "gouvernance" && ctx.isCeo ? supabase.from("governance_settings").select("*").maybeSingle() : Promise.resolve({ data: null }),
+    onglet === "gouvernance" && ctx.isCeo ? getPeople() : Promise.resolve([]),
   ]);
+  const tabs = [{ key: "profil", label: "Profil" }, { key: "notifications", label: "Notifications" }, { key: "securite", label: "Sécurité & sessions" }];
+  if (ctx.isCeo) tabs.push({ key: "gouvernance", label: "Gouvernance" });
   return (
     <div className="max-w-3xl">
       <PageHeader title="Paramètres" description="Votre profil, vos notifications, votre sécurité et vos sessions." />
-      <LinkTabs basePath="/parametres" active={onglet} className="mb-6" tabs={[{ key: "profil", label: "Profil" }, { key: "notifications", label: "Notifications" }, { key: "securite", label: "Sécurité & sessions" }]} />
-      {onglet === "notifications" ? (
+      <LinkTabs basePath="/parametres" active={onglet} className="mb-6" tabs={tabs} />
+      {onglet === "gouvernance" && ctx.isCeo && governance ? (
+        <GovernanceSettings settings={governance as Governance} people={people} currentUserId={ctx.userId} />
+      ) : onglet === "notifications" ? (
         <NotificationSettings
           initial={{ ...DEFAULT_PREFERENCES, ...((prefs ?? {}) as Partial<NotificationPreferences>) }}
           devices={devices ?? []}

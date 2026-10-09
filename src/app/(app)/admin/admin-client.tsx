@@ -45,13 +45,14 @@ export function InviteButton({ units, people, isCeo }: { units: { id: string; la
   );
 }
 
-export function UserMenu({ id, email, status, self }: { id: string; email: string; status: string; self: boolean }) {
+export function UserMenu({ id, email, status, self, protectedAccount }: { id: string; email: string; status: string; self: boolean; protectedAccount?: boolean }) {
   const [pending, start] = useTransition();
   const run = (fn: () => Promise<{ ok: boolean; message?: string; error?: string }>, msg?: string) => {
     if (msg && !confirm(msg)) return;
     start(async () => { const r = await fn(); if (r.ok) toast.success(r.message); else toast.error(r.error); });
   };
   if (self) return null;
+  if (protectedAccount) return <span className="text-xs text-subtle" title="Seul le CEO agit sur le compte d'un CEO">Protégé</span>;
   return (
     <Dropdown>
       <DropdownTrigger disabled={pending} className="rounded-md p-1.5 text-subtle hover:bg-surface-2 hover:text-fg" aria-label="Actions"><MoreHorizontal className="h-4 w-4" /></DropdownTrigger>
@@ -73,20 +74,20 @@ export function UserMenu({ id, email, status, self }: { id: string; email: strin
   );
 }
 
-export function GrantButton({ people, units, permissions }: { people: ProfileLite[]; units: { id: string; label: string }[]; permissions: { key: string; label: string; scopable: boolean }[] }) {
+export function GrantButton({ people, units, permissions, isCeo, maxDays }: { people: ProfileLite[]; units: { id: string; label: string }[]; permissions: { key: string; label: string; scopable: boolean; reserved?: boolean }[]; isCeo: boolean; maxDays: number }) {
   const [open, setOpen] = useState(false);
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild><Button size="sm" variant="outline"><Plus className="h-4 w-4" /> Dérogation</Button></DialogTrigger>
-      <DialogContent title="Accorder une dérogation" description="Droit manuel, temporaire et motivé. Il est journalisé et visible par l'audit.">
+      <DialogContent title="Accorder une dérogation" description={`Droit manuel, temporaire (${maxDays} jours au plus) et motivé. Il est journalisé et visible par l'audit.${isCeo ? "" : " Les permissions sensibles (finance, RH, décisions du CEO…) ne s'accordent que par le CEO."}`}>
         <ActionForm action={grantException} onSuccess={() => setOpen(false)}>
           <Field label="Bénéficiaire" htmlFor="profile_id" required><PersonSelect people={people} name="profile_id" required placeholder="Choisir…" /></Field>
           <Field label="Permission" htmlFor="permission" required>
-            <Select id="permission" name="permission" required>{permissions.map((p) => <option key={p.key} value={p.key}>{p.label} ({p.key})</option>)}</Select>
+            <Select id="permission" name="permission" required>{permissions.filter((p) => isCeo || !p.reserved).map((p) => <option key={p.key} value={p.key}>{p.label} ({p.key}){p.reserved ? " — réservée au CEO" : ""}</option>)}</Select>
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Limitée à l'unité" htmlFor="scope_unit_id" hint="Pour les permissions d'unité"><UnitSelect units={units} name="scope_unit_id" placeholder="— Globale —" /></Field>
-            <Field label="Durée" htmlFor="days"><Select id="days" name="days" defaultValue="30"><option value="7">7 jours</option><option value="30">30 jours</option><option value="90">90 jours</option><option value="">Sans expiration</option></Select></Field>
+            <Field label="Durée" htmlFor="days"><Select id="days" name="days" defaultValue={String(Math.min(30, maxDays))} required>{[7, 15, 30, 60, 90, 180, 366].filter((d) => d <= maxDays).map((d) => <option key={d} value={d}>{d} jours</option>)}{![7, 15, 30, 60, 90, 180, 366].includes(maxDays) && <option value={maxDays}>{maxDays} jours</option>}</Select></Field>
           </div>
           <Field label="Motif" htmlFor="reason" required><Textarea id="reason" name="reason" required rows={2} placeholder="Ex. : intérim du CFO pendant ses congés" /></Field>
         </ActionForm>

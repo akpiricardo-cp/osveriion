@@ -40,7 +40,7 @@ export default async function ProjectPage({
   ] = await Promise.all([
     supabase.from("tasks").select("*").eq("project_id", id).order("position"),
     supabase.from("project_members").select("profile_id, role").eq("project_id", id),
-    supabase.from("task_dependencies").select("task_id, depends_on_id"),
+    supabase.from("task_dependencies").select("task_id, depends_on_id, tasks!task_dependencies_task_id_fkey!inner(project_id)").eq("tasks.project_id", id),
     supabase.from("channels").select("id").eq("project_id", id).maybeSingle(),
     supabase.rpc("can_manage_project", { p_project: id }),
     supabase.rpc("can_contribute_project", { p_project: id }),

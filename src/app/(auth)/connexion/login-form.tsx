@@ -73,7 +73,7 @@ export function LoginForm() {
         </Button>
       </form>
       <p className="mt-8 text-center text-xs text-subtle">
-        Accès réservé aux collaborateurs VERIION. Toute connexion est journalisée.
+        Accès réservé aux collaborateurs VERIION. Les connexions sont tracées par le service d&apos;authentification.
       </p>
     </div>
   );

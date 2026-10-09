@@ -131,27 +131,34 @@ function ContractMenu({ contract, formData }: { contract: LegalContract; formDat
         <MoreHorizontal className="h-4 w-4" />
       </DropdownTrigger>
       <DropdownContent>
-        <ContractDialog
-          {...formData}
-          contract={c}
-          trigger={
-            <DropdownItem onSelect={(e) => e.preventDefault()}>
-              <PenLine className="h-4 w-4 text-subtle" /> Modifier
-            </DropdownItem>
-          }
-        />
+        {(c.status === "draft" || c.status === "legal_review") && (
+          <ContractDialog
+            {...formData}
+            contract={c}
+            trigger={
+              <DropdownItem onSelect={(e) => e.preventDefault()}>
+                <PenLine className="h-4 w-4 text-subtle" /> Modifier
+              </DropdownItem>
+            }
+          />
+        )}
         {c.status === "draft" && (
           <DropdownItem onSelect={() => run(() => setContractStatus(c.id, "legal_review"))}>
             <Gavel className="h-4 w-4 text-subtle" /> Passer en revue juridique
           </DropdownItem>
         )}
-        {(c.status === "draft" || c.status === "legal_review") && (
+        {c.status === "legal_review" && (
+          <DropdownItem onSelect={() => run(() => setContractStatus(c.id, "draft"))}>
+            <PenLine className="h-4 w-4 text-subtle" /> Renvoyer en rédaction
+          </DropdownItem>
+        )}
+        {c.status === "legal_review" && (
           <DropdownItem onSelect={() => run(() => submitContract(c.id))}>
             <Send className="h-4 w-4 text-subtle" /> Envoyer à la signature du CEO
           </DropdownItem>
         )}
         {c.status === "pending_ceo" && (
-          <DropdownItem onSelect={() => run(() => signContract(c.id), "L'accord du CEO est-il donné ? Le contrat passera en vigueur.")}>
+          <DropdownItem onSelect={() => run(() => signContract(c.id), "Acter la signature ? Elle n'est possible qu'avec l'accord du CEO sur cette version exacte du contrat.")}>
             <FileSignature className="h-4 w-4 text-subtle" /> Acter la signature
           </DropdownItem>
         )}

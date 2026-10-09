@@ -16,7 +16,9 @@ export function explain(error: PostgrestError | Error | null | undefined): strin
     case "23503":
       return "Élément lié introuvable ou encore utilisé ailleurs.";
     case "23514":
-      return "Une des valeurs saisies n'est pas valide.";
+      return e.message && !e.message.includes("violates check constraint") ? e.message : "Une des valeurs saisies n'est pas valide.";
+    case "40001":
+      return e.message || "Le contenu a été modifié entre-temps : rechargez la page.";
     case "22P02":
       return "Format de donnée invalide.";
     case "PGRST116":

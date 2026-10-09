@@ -83,6 +83,20 @@ export function navAccess(ctx: AppContext) {
   };
 }
 
+/**
+ * Rôles qui manipulent l'argent, les personnes, les contrats ou les droits :
+ * la double authentification leur est imposée (la base exige le niveau aal2
+ * pour ces opérations, l'interface les fait enrôler dès l'entrée).
+ */
+const STRONG_AUTH_PERMS = [
+  "finance.admin", "finance.view", "hr.admin", "legal.admin", "approvals.decide",
+  "grants.manage", "users.admin", "docs.confidential", "dashboard.exec",
+];
+
+export function needsStrongAuth(ctx: AppContext) {
+  return ctx.isAdmin || STRONG_AUTH_PERMS.some((p) => ctx.grants.some((g) => g.permission === p));
+}
+
 /** Peut décider des validations de la holding (le CEO, ou une délégation explicite). */
 export function canDecideApprovals(ctx: AppContext) {
   return ctx.isCeo || can(ctx, "approvals.decide");

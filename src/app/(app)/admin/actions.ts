@@ -56,11 +56,19 @@ export async function setUserStatus(profileId: string, status: "active" | "suspe
     const ctx = await requireAdmin();
     if (profileId === ctx.userId) return fail("Vous ne pouvez pas modifier votre propre statut.");
     const supabase = await createClient();
-    const { error } = await supabase.from("profiles").update({ status }).eq("id", profileId);
+    const { data: target } = await supabase.from("profiles").select("system_role, status").eq("id", profileId).single();
+    if (!target) return fail("Compte introuvable.");
+    if (target.system_role === "ceo" && !ctx.isCeo) return fail("Seul le CEO peut agir sur le compte d'un CEO.");
+    const { data: changed, error } = await supabase.from("profiles").update({ status }).eq("id", profileId).select("id");
     if (error) return fail(error);
-    // Bloque aussi la connexion côté Supabase Auth
+    if (!changed?.length) return fail("Modification refusée.");
+    // Bloque aussi la connexion côté Supabase Auth ; en cas d'échec, on revient en arrière.
     const admin = createAdminClient();
-    await admin.auth.admin.updateUserById(profileId, { ban_duration: status === "suspended" ? "876000h" : "none" });
+    const { error: banError } = await admin.auth.admin.updateUserById(profileId, { ban_duration: status === "suspended" ? "876000h" : "none" });
+    if (banError) {
+      await supabase.from("profiles").update({ status: target.status }).eq("id", profileId);
+      return fail(`Le blocage de la connexion a échoué (${banError.message}) : rien n'a été modifié.`);
+    }
     revalidatePath("/admin");
     return ok(status === "suspended" ? "Compte suspendu : la personne ne peut plus se connecter." : "Compte réactivé.");
   } catch (e) {
@@ -75,9 +83,10 @@ export async function offboardUser(profileId: string): Promise<ActionResult> {
     const { error } = await supabase.rpc("offboard_employee", { p_profile: profileId });
     if (error) return fail(error);
     const admin = createAdminClient();
-    await admin.auth.admin.updateUserById(profileId, { ban_duration: "876000h" });
+    const { error: banError } = await admin.auth.admin.updateUserById(profileId, { ban_duration: "876000h" });
     revalidatePath("/admin");
     revalidatePath("/annuaire");
+    if (banError) return fail(`Départ enregistré, mais le blocage de la connexion a échoué (${banError.message}). Les données restent inaccessibles (compte inactif) ; relancez le blocage depuis Supabase.`);
     return ok("Départ enregistré : accès révoqués, tâches désassignées, checklist de départ créée.");
   } catch (e) {
     return fail(e instanceof Error ? e.message : "Erreur");
@@ -118,12 +127,13 @@ export async function grantException(_: ActionResult | null, fd: FormData): Prom
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   const days = numVal(fd, "days");
+  if (!days || days < 1) return fail("Indiquez la durée de la dérogation.");
   const { error } = await supabase.from("role_grants").insert({
     profile_id: str(fd, "profile_id"),
     permission: str(fd, "permission"),
     scope_unit_id: str(fd, "scope_unit_id"),
     reason: str(fd, "reason"),
-    expires_at: days ? new Date(Date.now() + days * 86400000).toISOString() : null,
+    expires_at: new Date(Date.now() + days * 86400000).toISOString(),
     source: "manual",
     granted_by: user!.id,
   });

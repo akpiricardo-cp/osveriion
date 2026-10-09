@@ -30,15 +30,12 @@ export function RequestApprovalButton({
       </DialogTrigger>
       <DialogContent
         title="Soumettre une décision au CEO"
-        description={`Au-delà de ${money(threshold)}, une dépense ou un budget exige son accord. Les contrats et calendriers mensuels se soumettent depuis leur fiche.`}
+        description={`Au-delà de ${money(threshold)}, une dépense exige son accord. Budgets, contrats, embauches, lancements de projet et calendriers mensuels se soumettent depuis leur fiche : la demande reprend alors exactement leur contenu.`}
       >
         <ActionForm action={submitApproval} submitLabel="Transmettre" onSuccess={() => { setOpen(false); router.refresh(); }}>
           <Field label="Nature de la décision" htmlFor="kind" required>
             <Select id="kind" name="kind" defaultValue="expense">
-              <option value="expense">Dépense</option>
-              <option value="budget">Budget</option>
-              <option value="project">Lancement de projet</option>
-              <option value="employment_contract">Contrat de travail</option>
+              <option value="expense">Dépense (accord consommé au fil des paiements)</option>
               <option value="other">Autre arbitrage</option>
             </Select>
           </Field>
@@ -68,6 +65,34 @@ export function RequestApprovalButton({
         </ActionForm>
       </DialogContent>
     </Dialog>
+  );
+}
+
+const SNAPSHOT_LABELS: Record<string, string> = {
+  amount: "Montant", currency: "Devise", fiscal_year: "Exercice", title: "Intitulé", type: "Type", counterparty: "Contrepartie",
+  effective_date: "Prise d'effet", end_date: "Échéance", auto_renew: "Renouvellement tacite", obligations: "Engagements",
+  job_title: "Poste", start_date: "Début", weekly_hours: "Heures / semaine", gross_monthly: "Salaire brut mensuel",
+  name: "Nom", budget: "Budget", kind: "Cycle", period_start: "Du", period_end: "Au",
+};
+const SNAPSHOT_HIDDEN = new Set(["unit_id", "project_id", "profile_id", "lead_id", "document_id"]);
+
+function Snapshot({ data }: { data: Record<string, unknown> }) {
+  const entries = Object.entries(data).filter(([k, v]) => v !== null && v !== "" && !SNAPSHOT_HIDDEN.has(k));
+  if (!entries.length) return null;
+  const show = (k: string, v: unknown) => {
+    if (typeof v === "boolean") return v ? "oui" : "non";
+    if ((k === "amount" || k === "gross_monthly" || k === "budget") && v != null) return money(Number(v));
+    return String(v);
+  };
+  return (
+    <dl className="mt-3 grid grid-cols-1 gap-x-4 gap-y-1 rounded-lg border border-border px-3 py-2 text-[12.5px] sm:grid-cols-2">
+      {entries.map(([k, v]) => (
+        <div key={k} className="flex gap-2">
+          <dt className="shrink-0 text-subtle">{SNAPSHOT_LABELS[k] ?? k}</dt>
+          <dd className="min-w-0 truncate text-fg">{show(k, v)}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
@@ -162,10 +187,13 @@ export function ApprovalList({
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge tone="violet">{approvalKind[a.kind]}</Badge>
                     <Badge tone={approvalStatus[a.status].tone} dot>{approvalStatus[a.status].label}</Badge>
+                    {a.direct_decision && <Badge tone="blue">Décision directe</Badge>}
+                    {a.stale && <Badge tone="red" dot>Contenu modifié depuis — accord caduc</Badge>}
                     {context && <span className="truncate text-xs text-subtle">{context}</span>}
                   </div>
                   <p className="mt-2 text-[15px] font-semibold leading-snug text-fg">{a.subject_label}</p>
                   {a.justification && <p className="mt-1 whitespace-pre-line text-sm leading-relaxed text-muted">{a.justification}</p>}
+                  {a.subject_snapshot && <Snapshot data={a.subject_snapshot} />}
                   <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-subtle">
                     <span className="inline-flex items-center gap-1.5">
                       <Avatar name={author?.full_name ?? "—"} src={author?.avatar_url} size="xs" />
@@ -191,11 +219,16 @@ export function ApprovalList({
                   {a.amount != null && (
                     <p className="text-right text-lg font-semibold tabular-nums text-fg">{money(a.amount, a.currency)}</p>
                   )}
+                  {a.kind === "expense" && a.status === "approved" && a.amount != null && (
+                    <p className="text-right text-xs text-subtle">
+                      Engagé {money(a.consumed_amount ?? 0, a.currency)} · reste {money(Number(a.amount) - Number(a.consumed_amount ?? 0), a.currency)}
+                    </p>
+                  )}
                   {a.status === "pending" && (
                     <div className="flex flex-wrap gap-2">
-                      {canDecide && <DecisionDialog request={a} approve onDone={() => router.refresh()} />}
-                      {canDecide && <DecisionDialog request={a} approve={false} onDone={() => router.refresh()} />}
-                      {!canDecide && a.requested_by === userId && (
+                      {canDecide && a.requested_by !== userId && <DecisionDialog request={a} approve onDone={() => router.refresh()} />}
+                      {canDecide && a.requested_by !== userId && <DecisionDialog request={a} approve={false} onDone={() => router.refresh()} />}
+                      {a.requested_by === userId && (
                         <Button
                           size="sm"
                           variant="ghost"

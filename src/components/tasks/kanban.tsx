@@ -88,6 +88,10 @@ export function ProjectBoard({
       if (!r.ok) {
         setTasks(prev);
         toast.error(r.error);
+      } else if (r.message) {
+        // Soumise à vérification plutôt que close : la carte rejoint « En revue ».
+        setTasks((ts) => ts.map((t) => (t.id === task.id ? { ...t, status: "review" } : t)));
+        toast.success(r.message);
       }
     });
   }

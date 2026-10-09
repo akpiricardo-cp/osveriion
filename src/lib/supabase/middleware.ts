@@ -6,6 +6,8 @@ const PUBLIC_PATHS = ["/connexion", "/mot-de-passe-oublie", "/auth"];
 // Accessibles alors que l'espace est encore verrouillé : la saisie du code
 // elle-même, et la définition du mot de passe après une invitation.
 const UNLOCKED_PATHS = ["/verrou", "/definir-mot-de-passe"];
+// Accessible avant la vérification du second facteur.
+const MFA_PATH = "/double-authentification";
 
 const matches = (path: string, paths: string[]) => paths.some((p) => path === p || path.startsWith(p + "/"));
 
@@ -65,6 +67,18 @@ export async function updateSession(request: NextRequest) {
       const suite = request.nextUrl.searchParams.get("suite");
       const next = suite?.startsWith("/") && !suite.startsWith("//") ? suite : "/";
       return NextResponse.redirect(new URL(next, request.url));
+    }
+
+    // Double authentification : qui l'a activée doit la valider à chaque session
+    // (niveau aal2), avant d'accéder à l'application et aux fichiers.
+    if (unlocked && !onLockScreen && !matches(path, [MFA_PATH])) {
+      const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+      if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
+        const url = request.nextUrl.clone();
+        url.pathname = MFA_PATH;
+        url.search = path !== "/" ? `?suite=${encodeURIComponent(path + request.nextUrl.search)}` : "";
+        return NextResponse.redirect(url);
+      }
     }
   }
 

@@ -120,9 +120,30 @@ export type TaskPatch = Partial<{
   position: number; objective_id: string | null;
 }>;
 
+const TASK_PATCH_KEYS = new Set<keyof TaskPatch>([
+  "title", "description", "status", "priority", "assignee_id", "due_date", "start_date",
+  "estimate_hours", "requires_validation", "position", "objective_id",
+]);
+
 export async function updateTask(id: string, patch: TaskPatch, projectId?: string | null): Promise<ActionResult> {
   const supabase = await createClient();
-  const { error } = await supabase.from("tasks").update(patch).eq("id", id);
+  const clean = Object.fromEntries(Object.entries(patch).filter(([k]) => TASK_PATCH_KEYS.has(k as keyof TaskPatch))) as TaskPatch;
+
+  // Une tâche confiée ne se clôt pas par son titulaire : terminer = soumettre à vérification.
+  if (clean.status === "done" || clean.status === "review") {
+    const { data: { user } } = await supabase.auth.getUser();
+    const { data: t } = await supabase.from("tasks").select("assignee_id, reviewer_id, reporter_id, requires_validation, status").eq("id", id).maybeSingle();
+    const reviewer = t?.reviewer_id ?? t?.reporter_id;
+    if (t && user && t.requires_validation && t.assignee_id === user.id && reviewer && reviewer !== user.id && t.status !== "done") {
+      const { error } = await supabase.rpc("submit_task", { p_task: id, p_note: null });
+      if (error) return fail(error);
+      if (clean.position !== undefined) await supabase.from("tasks").update({ position: clean.position }).eq("id", id);
+      refresh(projectId);
+      return ok("Tâche soumise à vérification : la personne qui vous l'a confiée est prévenue.");
+    }
+  }
+
+  const { error } = await supabase.from("tasks").update(clean).eq("id", id);
   if (error) return fail(error);
   refresh(projectId);
   return ok();

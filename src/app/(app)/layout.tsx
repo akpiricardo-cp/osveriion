@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { getContext, navAccess } from "@/lib/auth";
+import { getContext, navAccess, needsStrongAuth } from "@/lib/auth";
 import { systemRole } from "@/lib/labels";
 import { SidebarNav } from "@/components/shell/sidebar";
 import { Topbar } from "@/components/shell/topbar";
@@ -17,6 +17,17 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   // Annuaire, mentions, organigramme : tout repose sur des fiches remplies.
   // Tant que la sienne ne l'est pas, l'application reste fermée.
   if (!ctx.profile.profile_completed_at) redirect("/completer-profil");
+
+  // Double authentification : imposée aux rôles sensibles tant que la direction
+  // ne l'a pas désactivée (Paramètres › Gouvernance). Le middleware redemande le
+  // code à chaque session pour ceux qui l'ont activée.
+  if (needsStrongAuth(ctx)) {
+    const [{ data: gov }, { data: aal }] = await Promise.all([
+      supabase.from("governance_settings").select("mfa_enforced").maybeSingle(),
+      supabase.auth.mfa.getAuthenticatorAssuranceLevel(),
+    ]);
+    if ((gov?.mfa_enforced ?? true) && aal && aal.nextLevel !== "aal2") redirect("/double-authentification?inscription=1");
+  }
 
   // Présence : met à jour la dernière activité (au plus toutes les 5 minutes)
   if (!ctx.profile.last_seen_at || Date.now() - new Date(ctx.profile.last_seen_at).getTime() > 5 * 60000) {

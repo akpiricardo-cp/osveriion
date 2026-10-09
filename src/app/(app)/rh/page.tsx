@@ -12,7 +12,7 @@ import { Card, CardHeader } from "@/components/ui/card";
 import { EmptyState, PageHeader, Progress, StatCard, Table, Td, Th, Tr } from "@/components/ui/misc";
 import { LinkTabs } from "@/components/ui/tabs";
 import { LifecycleChecklist } from "./lifecycle-checklist";
-import { CancelLeaveButton, ContractButton, DecideButtons, LeaveRequestButton, LifecycleItemButton } from "./rh-client";
+import { CancelLeaveButton, ContractButton, ContractStepButtons, DecideButtons, LeaveRequestButton, LifecycleItemButton } from "./rh-client";
 
 export const metadata = { title: "Ressources humaines" };
 const ANNUAL_ALLOWANCE = 30; // 2,5 jours ouvrables par mois (Code du travail béninois)
@@ -135,7 +135,14 @@ export default async function HrPage({ searchParams }: { searchParams: Promise<{
     const all = profiles ?? [];
     const active = all.filter((p) => p.status === "active");
     const payroll = active.reduce((s, p) => s + Number((salaries ?? []).find((x) => x.profile_id === p.id)?.gross_monthly ?? 0), 0);
-    const ending = (contracts ?? []).filter((c) => c.end_date && c.end_date >= new Date().toISOString().slice(0, 10) && c.end_date <= new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10));
+    const signed = (contracts ?? []).filter((c) => c.status === "signed");
+    const ending = signed.filter((c) => c.end_date && c.end_date >= new Date().toISOString().slice(0, 10) && c.end_date <= new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10));
+    const inProgress = (contracts ?? []).filter((c) => c.status === "draft" || c.status === "pending_ceo");
+    const { data: decisions } = inProgress.length
+      ? await supabase.from("approval_requests_status").select("subject_id, status, stale").eq("kind", "employment_contract").in("subject_id", inProgress.map((c) => c.id))
+      : { data: [] as { subject_id: string; status: string; stale: boolean }[] };
+    const approvedIds = new Set((decisions ?? []).filter((d) => d.status === "approved" && !d.stale).map((d) => d.subject_id));
+    const statusLabel: Record<string, string> = { draft: "Brouillon", pending_ceo: "Chez le CEO", signed: "Signé", ended: "Clos" };
     return (
       <div className="space-y-6">
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -144,6 +151,28 @@ export default async function HrPage({ searchParams }: { searchParams: Promise<{
           <StatCard label="Fins de contrat (60 j)" value={ending.length} icon={CalendarClock} tone={ending.length ? "amber" : "green"} />
           {hrAdmin ? <StatCard label="Masse salariale mensuelle" value={money(payroll, "XOF", true)} icon={ClipboardCheck} tone="cyan" hint="brut, effectif actif" /> : <StatCard label="Départs" value={all.filter((p) => p.status === "offboarded").length} icon={Users} tone="red" />}
         </div>
+        {hrAdmin && inProgress.length > 0 && (
+          <Card>
+            <CardHeader title="Contrats en préparation" description="Brouillon → accord du CEO → signature. Le salaire convenu s'applique à la signature." icon={<ClipboardCheck className="h-4 w-4" />} />
+            <div className="mt-3">
+              <Table>
+                <thead><tr><Th>Collaborateur</Th><Th>Contrat</Th><Th>Début</Th><Th className="text-right">Brut mensuel</Th><Th>Étape</Th><Th /></tr></thead>
+                <tbody>
+                  {inProgress.map((c) => (
+                    <Tr key={c.id}>
+                      <Td className="font-medium">{pm.get(c.profile_id)?.full_name ?? "—"}<span className="block text-xs text-subtle">{c.job_title ?? ""}</span></Td>
+                      <Td><Badge tone="blue">{contractType[c.type as keyof typeof contractType]}</Badge></Td>
+                      <Td className="text-muted">{dateFr(c.start_date)}</Td>
+                      <Td className="text-right tabular-nums">{c.gross_monthly != null ? money(c.gross_monthly) : "—"}</Td>
+                      <Td><Badge tone={approvedIds.has(c.id) ? "green" : c.status === "pending_ceo" ? "amber" : "neutral"} dot>{approvedIds.has(c.id) ? "Accord obtenu" : statusLabel[c.status]}</Badge></Td>
+                      <Td className="text-right"><ContractStepButtons id={c.id} status={c.status} approved={approvedIds.has(c.id)} /></Td>
+                    </Tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          </Card>
+        )}
         <Card>
           <CardHeader title="Collaborateurs" action={hrAdmin ? <ContractButton people={people} /> : undefined} />
           <div className="mt-3">
@@ -151,7 +180,7 @@ export default async function HrPage({ searchParams }: { searchParams: Promise<{
               <thead><tr><Th>Collaborateur</Th><Th>Contrat</Th><Th>Arrivée</Th><Th>Fin</Th>{hrAdmin && <Th className="text-right">Brut mensuel</Th>}<Th>Statut</Th>{hrAdmin && <Th />}</tr></thead>
               <tbody>
                 {all.map((p) => {
-                  const c = (contracts ?? []).find((x) => x.profile_id === p.id);
+                  const c = signed.find((x) => x.profile_id === p.id);
                   const s = (salaries ?? []).find((x) => x.profile_id === p.id);
                   return (
                     <Tr key={p.id}>

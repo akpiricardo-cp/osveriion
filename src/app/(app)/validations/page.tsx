@@ -18,9 +18,10 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Pr
   const decider = canDecideApprovals(ctx);
   const supabase = await createClient();
 
-  const [{ data: rows }, { data: settings }, people, units, { data: projects }] = await Promise.all([
-    supabase.from("approval_requests").select("*").order("created_at", { ascending: false }).limit(200),
-    supabase.from("company_settings").select("ceo_approval_threshold, currency").maybeSingle(),
+  const [{ data: rows }, { data: settings }, { data: governance }, people, units, { data: projects }] = await Promise.all([
+    supabase.from("approval_requests_status").select("*").order("created_at", { ascending: false }).limit(200),
+    supabase.from("company_settings").select("currency").maybeSingle(),
+    supabase.from("governance_settings").select("ceo_approval_threshold").maybeSingle(),
     getPeople(),
     getUnits(),
     supabase.from("projects").select("id, name").is("archived_at", null).order("name"),
@@ -31,7 +32,7 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Pr
   const mine = all.filter((a) => a.requested_by === ctx.userId);
   const decided = all.filter((a) => a.status !== "pending");
   const shown = onglet === "mes-demandes" ? mine : onglet === "historique" ? decided : pending;
-  const threshold = Number(settings?.ceo_approval_threshold ?? 500000);
+  const threshold = Number(governance?.ceo_approval_threshold ?? 500000);
   const engaged = pending.reduce((s, a) => s + Number(a.amount ?? 0), 0);
 
   return (

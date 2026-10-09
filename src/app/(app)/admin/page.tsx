@@ -85,7 +85,7 @@ export default async function AdminPage({ searchParams }: { searchParams: Promis
                   </Td>
                   <Td><Badge tone={p.status === "active" ? "green" : p.status === "suspended" ? "amber" : "neutral"} dot>{p.status === "active" ? "Actif" : p.status === "suspended" ? "Suspendu" : "Parti"}</Badge></Td>
                   <Td className="text-xs text-subtle">{p.last_seen_at ? relative(p.last_seen_at) : "—"}</Td>
-                  <Td className="text-right"><UserMenu id={p.id} email={p.email} status={p.status} self={p.id === ctx.userId} /></Td>
+                  <Td className="text-right"><UserMenu id={p.id} email={p.email} status={p.status} self={p.id === ctx.userId} protectedAccount={p.system_role === "ceo" && !ctx.isCeo} /></Td>
                 </Tr>
               ))}
             </tbody>
@@ -96,9 +96,10 @@ export default async function AdminPage({ searchParams }: { searchParams: Promis
   }
 
   async function GrantsTab() {
-    const [{ data: grants }, { data: perms }] = await Promise.all([
+    const [{ data: grants }, { data: perms }, { data: gov }] = await Promise.all([
       supabase.from("role_grants").select("*").order("created_at", { ascending: false }),
       supabase.from("permissions").select("*").order("category"),
+      supabase.from("governance_settings").select("max_grant_days").maybeSingle(),
     ]);
     const permLabel = new Map((perms ?? []).map((p) => [p.key, p.label]));
     const manual = (grants ?? []).filter((g) => g.source === "manual");
@@ -109,7 +110,7 @@ export default async function AdminPage({ searchParams }: { searchParams: Promis
       <div className="space-y-6">
         <Card>
           <CardHeader title="Dérogations manuelles" description="Droits accordés hors organigramme — temporaires et motivés." icon={<ShieldCheck className="h-4 w-4" />}
-            action={canGrants ? <GrantButton people={people} units={opts} permissions={(perms ?? []).map((p) => ({ key: p.key, label: p.label, scopable: p.scopable }))} /> : undefined} />
+            action={canGrants ? <GrantButton people={people} units={opts} isCeo={ctx.isCeo} maxDays={gov?.max_grant_days ?? 90} permissions={(perms ?? []).map((p) => ({ key: p.key, label: p.label, scopable: p.scopable, reserved: p.reserved }))} /> : undefined} />
           <div className="mt-3">
             {manual.length === 0 ? <p className="px-5 pb-5 text-sm text-muted">Aucune dérogation active.</p> : (
               <Table>

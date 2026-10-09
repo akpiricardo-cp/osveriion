@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2 } from "lucide-react";
+import { CheckCircle2, Plus, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTrigger } from "@/components/ui/dialog";
@@ -10,10 +10,12 @@ import { ActionForm } from "@/components/ui/action-form";
 import { Field, Input, Select, Textarea } from "@/components/ui/input";
 import { UnitSelect } from "@/components/pickers";
 import { COUNTRIES, EXPENSE_CATEGORIES, PRODUCTS, REVENUE_CATEGORIES } from "@/lib/labels";
-import { todayISO } from "@/lib/utils";
-import { addTransaction, createInvoice, deleteTransaction, setBudget } from "./actions";
+import { money, todayISO } from "@/lib/utils";
+import { activateBudget, addTransaction, createInvoice, reverseTransaction, setBudget } from "./actions";
 
-export function TransactionButton({ units, accounts }: { units: { id: string; label: string }[]; accounts: { id: string; name: string }[] }) {
+export type ExpenseApproval = { id: string; subject_label: string; amount: number; consumed_amount: number; remaining: number; currency: string };
+
+export function TransactionButton({ units, accounts, approvals, threshold }: { units: { id: string; label: string }[]; accounts: { id: string; name: string }[]; approvals: ExpenseApproval[]; threshold: number }) {
   const [open, setOpen] = useState(false);
   const [type, setType] = useState<"expense" | "revenue">("expense");
   return (
@@ -50,32 +52,72 @@ export function TransactionButton({ units, accounts }: { units: { id: string; la
             </Field>
           </div>
           <Field label="Référence / pièce" htmlFor="reference"><Input id="reference" name="reference" placeholder="N° de reçu, virement…" /></Field>
+          {type === "expense" && (
+            <Field label="Accord du CEO" htmlFor="approval_id" hint={`Obligatoire au-delà de ${money(threshold)}. Le montant est déduit du reste disponible de l'accord.`}>
+              <Select id="approval_id" name="approval_id" defaultValue="">
+                <option value="">— Aucun (dépense sous le seuil)</option>
+                {approvals.map((a) => <option key={a.id} value={a.id}>{a.subject_label} — reste {money(a.remaining, a.currency)}</option>)}
+              </Select>
+            </Field>
+          )}
         </ActionForm>
       </DialogContent>
     </Dialog>
   );
 }
 
-export function DeleteTransaction({ id }: { id: string }) {
+export function ReverseTransaction({ id }: { id: string }) {
   const [pending, start] = useTransition();
   return (
-    <button disabled={pending} aria-label="Supprimer" className="rounded p-1 text-subtle hover:text-danger disabled:opacity-40"
-      onClick={() => confirm("Supprimer cette opération ?") && start(async () => { const r = await deleteTransaction(id); if (r.ok) toast.success(r.message); else toast.error(r.error); })}>
-      <Trash2 className="h-4 w-4" />
+    <button disabled={pending} aria-label="Contre-passer" title="Annuler par contre-passation" className="rounded p-1 text-subtle hover:text-danger disabled:opacity-40"
+      onClick={() => {
+        const reason = prompt("Motif de l'annulation (une écriture inverse sera passée, l'opération reste tracée) :");
+        if (!reason || reason.trim().length < 3) return;
+        start(async () => { const r = await reverseTransaction(id, reason); if (r.ok) toast.success(r.message); else toast.error(r.error); });
+      }}>
+      <Undo2 className="h-4 w-4" />
     </button>
   );
 }
 
-export function BudgetButton({ units, year, unitId, amount }: { units: { id: string; label: string }[]; year: number; unitId?: string; amount?: number }) {
+export function ActivateBudget({ id }: { id: string }) {
+  const [pending, start] = useTransition();
+  return (
+    <Button size="sm" variant="outline" loading={pending}
+      onClick={() => start(async () => { const r = await activateBudget(id); if (r.ok) toast.success(r.message); else toast.error(r.error); })}>
+      <CheckCircle2 className="h-4 w-4" /> Activer
+    </Button>
+  );
+}
+
+export function BudgetButton({ units, projects, year, unitId, projectId, amount }: { units: { id: string; label: string }[]; projects: { id: string; label: string }[]; year: number; unitId?: string; projectId?: string; amount?: number }) {
   const [open, setOpen] = useState(false);
+  const [scope, setScope] = useState<"unit" | "project">(projectId ? "project" : "unit");
+  const editing = Boolean(unitId || projectId);
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        {unitId ? <button className="text-xs font-medium text-primary hover:underline">Modifier</button> : <Button size="sm"><Plus className="h-4 w-4" /> Définir un budget</Button>}
+        {editing ? <button className="text-xs font-medium text-primary hover:underline">Modifier</button> : <Button size="sm"><Plus className="h-4 w-4" /> Définir un budget</Button>}
       </DialogTrigger>
-      <DialogContent title="Budget annuel" size="sm">
+      <DialogContent title="Budget annuel" description="Enregistré en brouillon : activez-le ensuite. Modifier un budget actif le repasse en brouillon." size="sm">
         <ActionForm action={setBudget} onSuccess={() => setOpen(false)}>
-          <Field label="Unité" htmlFor="unit_id" required><UnitSelect units={units} name="unit_id" defaultValue={unitId} required /></Field>
+          {!editing && (
+            <div className="grid grid-cols-2 gap-2 rounded-xl bg-surface-2 p-1">
+              {([["unit", "Unité"], ["project", "Projet"]] as const).map(([k, l]) => (
+                <button key={k} type="button" onClick={() => setScope(k)} className={`rounded-lg py-2 text-sm font-medium transition ${scope === k ? "bg-surface text-fg shadow-sm" : "text-muted"}`}>{l}</button>
+              ))}
+            </div>
+          )}
+          {scope === "unit" ? (
+            <Field label="Unité" htmlFor="unit_id" required><UnitSelect units={units} name="unit_id" defaultValue={unitId} required /></Field>
+          ) : (
+            <Field label="Projet" htmlFor="project_id" required>
+              <Select id="project_id" name="project_id" defaultValue={projectId ?? ""} required>
+                <option value="" disabled>Choisir…</option>
+                {projects.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+              </Select>
+            </Field>
+          )}
           <div className="grid grid-cols-2 gap-4">
             <Field label="Exercice" htmlFor="fiscal_year"><Input id="fiscal_year" name="fiscal_year" type="number" defaultValue={year} /></Field>
             <Field label="Montant (FCFA)" htmlFor="amount" required><Input id="amount" name="amount" inputMode="numeric" defaultValue={amount} required /></Field>

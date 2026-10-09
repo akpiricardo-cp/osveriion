@@ -11,7 +11,7 @@ import { PersonSelect } from "@/components/pickers";
 import { contractType, leaveType } from "@/lib/labels";
 import type { ProfileLite } from "@/lib/types";
 import { todayISO } from "@/lib/utils";
-import { addContract, addLifecycleItem, cancelLeave, decideLeave, requestLeave } from "./actions";
+import { addContract, addLifecycleItem, cancelLeave, decideLeave, endEmploymentContract, requestLeave, signEmploymentContract, submitEmploymentContract } from "./actions";
 
 export function LeaveRequestButton() {
   const [open, setOpen] = useState(false);
@@ -74,7 +74,7 @@ export function ContractButton({ people, profileId }: { people: ProfileLite[]; p
             <Field label="Poste" htmlFor="job_title" className="sm:col-span-2"><Input id="job_title" name="job_title" /></Field>
             <Field label="Heures / semaine" htmlFor="weekly_hours"><Input id="weekly_hours" name="weekly_hours" type="number" defaultValue={40} /></Field>
           </div>
-          <Field label="Salaire brut mensuel (FCFA)" htmlFor="gross_monthly" hint="Visible uniquement par l'employé, les RH et la Finance."><Input id="gross_monthly" name="gross_monthly" inputMode="numeric" /></Field>
+          <Field label="Salaire brut mensuel (FCFA)" htmlFor="gross_monthly" hint="Couvert par l'accord du CEO ; appliqué à la signature. Visible uniquement par l'employé, les RH et la Finance."><Input id="gross_monthly" name="gross_monthly" inputMode="numeric" /></Field>
           <Field label="Notes" htmlFor="notes"><Textarea id="notes" name="notes" rows={2} /></Field>
         </ActionForm>
       </DialogContent>
@@ -97,5 +97,21 @@ export function LifecycleItemButton({ profileId, kind, people }: { profileId: st
         </ActionForm>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Étapes du contrat de travail : soumission au CEO, signature, clôture. */
+export function ContractStepButtons({ id, status, approved }: { id: string; status: string; approved: boolean }) {
+  const [pending, start] = useTransition();
+  const run = (fn: () => Promise<{ ok: boolean; message?: string; error?: string }>, msg?: string) => {
+    if (msg && !confirm(msg)) return;
+    start(async () => { const r = await fn(); if (r.ok) toast.success(r.message); else toast.error(r.error); });
+  };
+  return (
+    <div className="flex flex-wrap justify-end gap-2">
+      {status === "draft" && !approved && <Button size="sm" variant="outline" loading={pending} onClick={() => run(() => submitEmploymentContract(id))}>Soumettre au CEO</Button>}
+      {(status === "draft" || status === "pending_ceo") && approved && <Button size="sm" variant="success" loading={pending} onClick={() => run(() => signEmploymentContract(id), "Acter la signature du contrat ? La rémunération convenue s'appliquera.")}>Signer</Button>}
+      {status === "signed" && <Button size="sm" variant="ghost" loading={pending} onClick={() => run(() => endEmploymentContract(id), "Clore ce contrat ?")}>Clore</Button>}
+    </div>
   );
 }

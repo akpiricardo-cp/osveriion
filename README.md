@@ -24,18 +24,18 @@
 
 | Module | Fonctionnalités |
 | --- | --- |
-| **Identité & sécurité** | Connexion unique `prenom.nom@veriion.com`, **code d'accès personnel** redemandé à chaque nouvelle session (sans jamais déconnecter), mot de passe oublié, invitation par e-mail, sessions (déconnexion des autres appareils), suspension et départ d'un collaborateur |
+| **Identité & sécurité** | Connexion unique `prenom.nom@veriion.com` (seul ce domaine peut ouvrir un compte), **code d'accès personnel** redemandé à chaque nouvelle session (sans jamais déconnecter), **double authentification (TOTP) imposée aux rôles sensibles** et exigée par la base pour les opérations sensibles, mot de passe oublié, invitation par e-mail, sessions (déconnexion des autres appareils), suspension et départ d'un collaborateur. Le compte du CEO n'est modifiable que par le CEO ; la fonction se **transmet** (*Paramètres › Gouvernance*) |
 | **Organisation (holding)** | Deux axes qui se croisent : l'**équipe administrative** (Direction Générale, Opérations, Technologie, Finance, Business, Marketing, Juridique, RH — CEO, COO, CTO, CFO, CBO, CMO…) et les **projets**, chacun dirigé par son **Chief Product**. Chaque département désigne un **référent par projet**, ajouté automatiquement au canal du projet. Organigramme interactif, nomination datée **avec historique**, **fusion de deux unités** (les membres, sous-unités, budgets, canaux et dossiers suivent), création/réduction de départements par le CEO |
 | **Intitulés de poste** | Plus aucune saisie libre : l'unité porte les intitulés (responsable, adjoint, membre) et la **nomination attribue le poste**. Diriger un projet donne l'intitulé *Chief Product — <projet>* |
 | **Calendrier opérationnel** | Le département des **Opérations** écrit le calendrier de chaque projet (**mensuel**, **hebdomadaire**, **journalier**) sous forme de grandes lignes avec résultat attendu. Le mensuel passe par l'accord du CEO avant publication. Le chef de projet les découpe en tâches, puis **rend compte** à chaque cycle (avancement, blocages, prochaines étapes) ; les Opérations accusent réception |
-| **Validations du CEO** | Guichet unique des décisions qui engagent la holding : **budgets et dépenses au-delà d'un seuil** (réglable), **contrats**, **calendriers mensuels**, **lancement de projet** et **contrats de travail**. Accord ou refus motivé, notifié au demandeur ; la base refuse l'opération tant que l'accord n'est pas donné |
-| **Juridique** | Registre des contrats de la holding (NDA, partenariat, client, fournisseur, licence, actes statutaires) : rédaction, revue juridique, signature du CEO, prise d'effet, échéance, **préavis de renouvellement** avec rappel automatique, niveau de risque, engagements à tenir |
+| **Validations du CEO** | Guichet unique des décisions qui engagent la holding : **budgets et dépenses au-delà d'un seuil** (réglable par le CEO seul), **contrats**, **calendriers mensuels**, **lancement de projet** et **contrats de travail**. L'accord porte sur **un contenu figé** (instantané + empreinte : toute modification le rend caduc), un accord de dépense **se consomme** au fil des paiements, personne ne statue sur **sa propre demande**, et les décisions directes du CEO sont elles aussi inscrites au registre. La base refuse l'opération tant que l'accord valide n'existe pas |
+| **Juridique** | Registre des contrats de la holding (NDA, partenariat, client, fournisseur, licence, actes statutaires). Circuit imposé par la base : **rédaction → revue juridique (obligatoire) → accord du CEO → signature**. Un contrat signé ne se modifie plus. **Expiration et renouvellement tacite automatiques**, préavis avec rappel, niveau de risque, engagements à tenir |
 | **Droits automatiques** | Nommer quelqu'un responsable modifie **automatiquement** ses droits (règles configurables), dérogations manuelles temporaires et motivées |
 | **Communication** | Messagerie temps réel : conversations directes, canaux de groupe (publics/privés), canal par département et par projet, **fils de discussion**, **mentions @** avec autocomplétion et notification, **pièces jointes** (glisser-déposer, coller une capture, aperçu des images), **réactions**, **messages épinglés**, **recherche**, **appel vidéo en un clic** depuis la conversation, indicateur « est en train d'écrire », modification/suppression, non-lus, annonces de la direction |
 | **Projets & tâches** | Un projet = un Chief Product, une équipe, des référents. **Répartition hiérarchique** : on ne confie une tâche qu'à soi-même, à son équipe projet ou aux personnes que l'on encadre. Une tâche confiée par quelqu'un d'autre ne se clôt pas seule : son titulaire la **soumet à vérification**, et celui qui l'a confiée **valide ou la renvoie avec un motif**. Kanban glisser-déposer (souris et tactile), vue liste, sous-tâches, dépendances bloquantes, commentaires, temps réel, « Mes tâches » et « À vérifier » |
 | **CRM & partenariats** | Prospects/clients/partenaires, contacts, pipeline glisser-déposer, historique des interactions. **Une opportunité gagnée crée automatiquement le projet de livraison et la facture brouillon** |
-| **Finance** | Revenus, dépenses, trésorerie, factures (lignes, TVA, impression PDF), budgets par unité avec consommation, analyses par produit/pays/catégorie. **Une facture encaissée génère le revenu comptable** |
-| **RH** | Congés (solde, demande, validation par le responsable, notifications), contrats, salaires confidentiels, masse salariale, parcours d'intégration et de départ |
+| **Finance** | Revenus, dépenses, trésorerie, factures (lignes, TVA, impression PDF), budgets par unité **et par projet** (brouillon → activation, accord du CEO au-delà du seuil), analyses par produit/pays/catégorie. **Une facture encaissée génère le revenu comptable.** Intégrité : facture **figée dès son émission**, numérotation **continue par exercice**, aucune opération ne s'efface — on **contre-passe** (écriture inverse motivée) |
+| **RH** | Congés (demande, validation par le responsable, notifications), contrats de travail (**brouillon → accord du CEO → signature**, le salaire convenu s'applique à la signature), salaires confidentiels, masse salariale, parcours d'intégration et de départ |
 | **Documents (Drive)** | **Dossiers et sous-dossiers illimités** dans 4 types d'espaces : *Mon espace* (privé), *Département/équipe*, *Projet*, *Entreprise*. Droits selon les rôles + partage à une personne ou une unité (Lecteur / Éditeur / Gestionnaire, avec expiration), « Partagés avec moi », Récents, Favoris, corbeille (30 jours), déplacement par glisser-déposer, 3 niveaux de confidentialité, recherche plein texte **dans le contenu** |
 | **Éditeurs intégrés** | **Documents texte** (type Word : titres, listes, tableaux, images, couleurs, liens, cases à cocher), **tableurs** (type Excel : formules en français ou en anglais `SOMME`, `SI`, `RECHERCHEV`, `NB.SI`…, plusieurs feuilles, formats monétaire FCFA / % / date, somme automatique), **présentations** (type PowerPoint : dispositions, thèmes, images, notes de l'orateur, mode présentation plein écran). **Co-édition en temps réel** : plusieurs personnes écrivent dans le même document au même moment, avec le curseur et le nom de chacun (fusion Yjs pour le texte, cellule par cellule pour le tableur, diapositive par diapositive pour les présentations — on voit qui est sur quelle cellule ou quelle diapositive). Enregistrement automatique, **historique des versions avec restauration**. Import Word/Excel/CSV, export **.docx / .xlsx / .pptx / CSV / PDF**. Visionneuse PDF, images, vidéo, audio pour les fichiers déposés |
 | **Objectifs & KPI** | OKR entreprise → département → individuel, résultats clés mesurables, progression calculée, référentiel unique des indicateurs |
@@ -54,7 +54,7 @@ Recherche globale `Ctrl/⌘ + K`, thème clair/sombre, **100 % en français**.
 
 ```
 Navigateur (Next.js — React 19)
-        │  HTTPS, session en cookies httpOnly (@supabase/ssr)
+        │  HTTPS, session en cookies (@supabase/ssr) + verrou httpOnly du code d'accès
         ▼
 Next.js 15 (App Router) ── Server Components (lecture) ── Server Actions (écriture)
         │                         middleware : rafraîchit la session, protège les routes
@@ -112,7 +112,8 @@ Les départements ne commandent pas les équipes : ils coordonnent par leur réf
 - **il ne déconnecte jamais** : la session Supabase reste ouverte, l'application est seulement verrouillée. Le code rouvre l'espace là où on l'avait laissé ;
 - seul un hachage bcrypt est conservé, dans une table `access_codes` sans aucune policy RLS ni droit de lecture : tout passe par `set_access_code`, `verify_access_code` et `has_access_code` ;
 - 5 échecs consécutifs bloquent la saisie 15 minutes ; un administrateur peut effacer un code oublié (*Administration > Comptes*), la personne en choisit alors un nouveau ;
-- une fois le code accepté, un cookie `httpOnly` signé (HMAC-SHA256, `ACCESS_CODE_SECRET`) déverrouille l'espace pour la session du navigateur — 12 heures au maximum. Le middleware le vérifie à chaque requête, y compris pour les Server Actions et les fichiers.
+- une fois le code accepté, un cookie `httpOnly` signé (HMAC-SHA256, `ACCESS_CODE_SECRET`) déverrouille l'espace pour la session du navigateur — 12 heures au maximum. Le middleware le vérifie à chaque requête, y compris pour les Server Actions et les fichiers ;
+- **limite** : le code d'accès est vérifié par l'application, pas par la base. La session Supabase (cookies lisibles par le navigateur, nécessaires au temps réel) reste utilisable directement contre l'API. C'est pourquoi les opérations sensibles exigent, **en base**, la double authentification.
 
 Les fichiers privés ne sont jamais exposés par URL publique : ils passent par la route `/api/storage/<bucket>/…` qui les lit **avec la session de l'utilisateur**, donc sous les politiques RLS du stockage.
 
@@ -134,10 +135,12 @@ Créez le projet, choisissez une région proche (ex. `eu-west` ou `af-south` si 
 Dans **Supabase > SQL Editor > New query** :
 
 1. Collez le contenu de **`supabase/install.sql`** et cliquez **Run**.
-   Ce fichier regroupe, dans l'ordre, les 10 migrations et la structure de l'organisation (celle de votre organigramme : Direction Générale, Opérations, Technologie, Marketing, Business, Finance et leurs sous-unités).
+   Ce fichier regroupe, dans l'ordre, toutes les migrations et la structure de l'organisation (celle de votre organigramme : Direction Générale, Opérations, Technologie, Marketing, Business, Finance et leurs sous-unités).
 2. *(Optionnel)* Pour voir des tableaux de bord remplis pendant vos essais, exécutez **`supabase/demo.sql`** (données fictives : revenus, dépenses, CRM, métriques). Un bloc de nettoyage est fourni en bas du fichier.
 
 > **Vous aviez déjà exécuté une version précédente de `install.sql` ?** N'exécutez pas tout à nouveau : lancez seulement les migrations manquantes, dans l'ordre — depuis la version à 4 migrations : `20260926000005_drive.sql`, `20260926000006_messaging.sql` puis `20260927000007_collab_notifications.sql` ; depuis la version à 6 migrations : `20260927000007_collab_notifications.sql` puis `20260928000008_access_code.sql` ; depuis la version à 7 migrations : `20260928000008_access_code.sql`, `20260929000009_holding.sql` puis `20260930000010_operations_legal.sql`. Les deux dernières ajoutent les départements **Juridique** et **Ressources Humaines** s'ils manquent, posent les intitulés des officiers (CEO, COO, CTO, CFO, CBO, CMO) et recalculent les droits de chacun — vos unités et vos nominations existantes sont conservées. **Ces deux migrations sont rejouables** : si une exécution s'interrompt, relancez le fichier entier sans risque (tout y est conditionné par `if not exists`, et les reprises de données ne s'appliquent qu'au premier passage). Vos documents existants sont rangés automatiquement dans l'espace *Documents de l'entreprise* ou dans celui de leur département / projet.
+>
+> **Depuis la version à 10 migrations (phase 0 de l'audit)** : appliquez `20261012000011_p0_gouvernance.sql` à `20261012000015_p0_vues_interface.sql`, dans l'ordre. Le seuil des validations est repris de vos paramètres ; les budgets, contrats et factures existants restent dans leur état. Après application, chaque responsable sensible devra activer la double authentification à sa prochaine connexion.
 
 > Vous préférez la CLI Supabase ? `supabase link --project-ref <ref>` puis `supabase db push` applique `supabase/migrations/` ; exécutez ensuite `supabase/seed.sql`.
 
@@ -154,7 +157,7 @@ Les buckets de stockage (`documents`, `doc-assets`, `chat`, `avatars`) et leurs 
 **Authentication > Sign In / Providers > Email**
 - Activez *Email*. Après avoir créé le compte du CEO (étape 4), **désactivez « Allow new users to sign up »** : les comptes ne seront plus créés que par invitation.
 
-**Authentication > Multi-Factor** : rien à configurer. La double authentification TOTP n'est pas utilisée ; l'accès à l'espace est protégé par le **code d'accès personnel** que chaque collaborateur choisit lui-même (§ 4).
+**Authentication > Multi-Factor** : laissez **TOTP activé** (réglage par défaut). La double authentification est imposée aux rôles sensibles (CEO, administration, finance, RH, juridique, délégataires) : la base exige le niveau `aal2` pour les écritures financières, les contrats, les décisions du CEO, les dérogations et la lecture des salaires d'autrui. Le **code d'accès personnel** reste un verrou de confort pour rouvrir son espace ; il ne remplace pas la double authentification.
 
 **Authentication > Emails > Templates** — remplacez le lien des deux modèles suivants :
 
@@ -255,7 +258,9 @@ Le **premier compte créé devient automatiquement CEO** (accès global).
 | Juridique | Adjoint / Responsable | Administrer le registre, soumettre les contrats à signature (`legal.admin`) |
 | Technologie | Responsable | Métriques produit et incidents |
 
-**Décisions réservées au CEO** (`approvals.decide`, délégable par dérogation) : budgets et dépenses au-delà du seuil défini dans *Paramètres*, contrats juridiques, calendriers mensuels, lancement de projet et contrats de travail. Ce ne sont pas de simples écrans : la base **refuse** l'écriture tant que l'accord n'est pas enregistré.
+**Permissions réservées** : `approvals.decide`, `finance.admin`, `finance.view`, `hr.admin`, `docs.confidential`, `grants.manage` et `dashboard.exec` ne s'accordent par dérogation **que par le CEO**. Toute dérogation a une **échéance** (90 jours au plus par défaut, réglable dans *Paramètres › Gouvernance*). Un administrateur ne peut ni modifier le seuil des validations, ni suspendre, rétrograder ou faire partir un CEO.
+
+**Décisions réservées au CEO** (`approvals.decide`, délégable par dérogation du CEO) : budgets et dépenses au-delà du seuil défini dans *Paramètres*, contrats juridiques, calendriers mensuels, lancement de projet et contrats de travail. Ce ne sont pas de simples écrans : la base **refuse** l'écriture tant que l'accord n'est pas enregistré.
 
 **Répartition des tâches** : `can_assign_task` autorise l'auto-assignation, le chef de projet vers les membres de son équipe, et un responsable vers les personnes qu'il encadre — rien d'autre. Une tâche confiée exige une vérification, et seul celui qui l'a confiée peut la clôturer.
 
@@ -314,9 +319,15 @@ Ils vérifient notamment : droits automatiques à la nomination, cloisonnement f
 
 ```bash
 npm run typecheck    # TypeScript strict
-npm run lint
+npm run lint         # ESLint
+npm test             # tests unitaires (Vitest)
+npm run test:sql     # scénarios SQL (PGURL=…)
 npm run build
+npm run build:install  # régénère supabase/install.sql après une migration
+npm run schema:dump    # régénère supabase/schema/schema.sql (état courant du schéma)
 ```
+
+La CI GitHub (`.github/workflows/ci.yml`) exécute tout cela à chaque pull request. Le scénario `70_gouvernance.sql` rejoue les contournements relevés par l'audit d'octobre 2026 et vérifie qu'ils sont tous refusés ; `80_finance_circuits.sql` couvre l'intégrité financière et les circuits budget / contrats. Exploitation (environnements, sauvegardes, supervision, secrets) : [`docs/EXPLOITATION.md`](docs/EXPLOITATION.md).
 
 ---
 
@@ -336,6 +347,12 @@ supabase/
     …0008_access_code.sql        code d'accès personnel (verrou de session)
     …0009_holding.sql            départements de la holding, projets, référents, intitulés, fusion, profil obligatoire
     …0010_operations_legal.sql   calendrier opérationnel, rapports, juridique, validations du CEO, tâches vérifiées
+    …0011_p0_gouvernance.sql     gouvernance fiable : seuil réservé au CEO, accords figés et consommés, double authentification
+    …0012_p0_durcissement.sql    privilèges explicites, inscriptions limitées au domaine
+    …0013_p0_integrite_financiere.sql  factures figées, numérotation continue, contre-passations
+    …0014_p0_circuits.sql        budgets, contrats de travail, machine à états des contrats juridiques
+    …0015_p0_vues_interface.sql  accords caducs, accords disponibles, supervision
+  schema/schema.sql              état courant du schéma (référence lisible, généré)
   notifications_schedule.sql     activation de l'envoi planifié (pg_cron + pg_net)
   seed.sql                       organigramme VERIION + référentiel KPI
   demo.sql                       données de démonstration (optionnel)

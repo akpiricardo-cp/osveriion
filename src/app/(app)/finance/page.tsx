@@ -7,11 +7,11 @@ import { COUNTRIES, invoiceStatus } from "@/lib/labels";
 import type { Invoice, Transaction } from "@/lib/types";
 import { cn, dateFr, money } from "@/lib/utils";
 import { Card, CardHeader } from "@/components/ui/card";
-import { LabelBadge } from "@/components/ui/badge";
+import { Badge, LabelBadge } from "@/components/ui/badge";
 import { EmptyState, Forbidden, PageHeader, Progress, StatCard, Table, Td, Th, Tr } from "@/components/ui/misc";
 import { LinkTabs } from "@/components/ui/tabs";
 import { HBarChart, RevenueExpenseChart } from "@/components/charts";
-import { BudgetButton, DeleteTransaction, InvoiceButton, TransactionButton } from "./finance-forms";
+import { ActivateBudget, BudgetButton, InvoiceButton, ReverseTransaction, TransactionButton, type ExpenseApproval } from "./finance-forms";
 
 export const metadata = { title: "Finance" };
 
@@ -28,6 +28,11 @@ export default async function FinancePage({ searchParams }: { searchParams: Prom
   const units = await getUnits();
   const opts = unitOptions(units);
   const { data: accounts } = fullRead ? await supabase.from("accounts").select("id, name").order("name") : { data: [] };
+  const [{ data: approvals }, { data: gov }] = await Promise.all([
+    admin ? supabase.rpc("available_expense_approvals") : Promise.resolve({ data: [] }),
+    supabase.from("governance_settings").select("ceo_approval_threshold").maybeSingle(),
+  ]);
+  const threshold = Number(gov?.ceo_approval_threshold ?? 500000);
   const from = `${year}-01-01`, to = `${year}-12-31`;
 
   const { data: txData } = await supabase.from("transactions").select("*").gte("occurred_on", from).lte("occurred_on", to).order("occurred_on", { ascending: false });
@@ -49,7 +54,7 @@ export default async function FinancePage({ searchParams }: { searchParams: Prom
               ))}
             </div>
             {admin && <InvoiceButton units={opts} accounts={accounts ?? []} />}
-            {admin && <TransactionButton units={opts} accounts={accounts ?? []} />}
+            {admin && <TransactionButton units={opts} accounts={accounts ?? []} approvals={(approvals ?? []) as ExpenseApproval[]} threshold={threshold} />}
           </>
         }
       />
@@ -70,14 +75,18 @@ export default async function FinancePage({ searchParams }: { searchParams: Prom
                 {tx.slice(0, 300).map((t) => (
                   <Tr key={t.id}>
                     <Td className="whitespace-nowrap text-muted">{dateFr(t.occurred_on, "d MMM yyyy")}</Td>
-                    <Td className="max-w-[280px]"><span className="block truncate font-medium">{t.description ?? t.category}</span>{t.reference && <span className="block truncate font-mono text-[11px] text-subtle">{t.reference}</span>}</Td>
+                    <Td className="max-w-[280px]">
+                      <span className={cn("block truncate font-medium", t.reversed_by && "text-muted line-through")}>{t.description ?? t.category}</span>
+                      {t.reference && <span className="block truncate font-mono text-[11px] text-subtle">{t.reference}</span>}
+                      {t.reverses_id && <span className="block truncate text-[11px] text-subtle">Contre-passation{t.reversal_reason ? ` — ${t.reversal_reason}` : ""}</span>}
+                    </Td>
                     <Td className="text-muted">{t.category}</Td>
                     <Td className="text-muted">{unitName(t.unit_id)}</Td>
                     <Td className="text-muted">{[t.product, t.country ? COUNTRIES[t.country] ?? t.country : null].filter(Boolean).join(" · ") || "—"}</Td>
                     <Td className={cn("whitespace-nowrap text-right font-semibold tabular-nums", t.type === "revenue" ? "text-emerald-600 dark:text-emerald-400" : "text-fg")}>
-                      {t.type === "revenue" ? "+" : "−"} {money(t.amount, t.currency)}
+                      {(t.type === "revenue") === (Number(t.amount) >= 0) ? "+" : "−"} {money(Math.abs(Number(t.amount)), t.currency)}
                     </Td>
-                    {admin && <Td>{!t.invoice_id && <DeleteTransaction id={t.id} />}</Td>}
+                    {admin && <Td>{!t.invoice_id && !t.reverses_id && !t.reversed_by && <ReverseTransaction id={t.id} />}</Td>}
                   </Tr>
                 ))}
               </tbody>
@@ -164,24 +173,39 @@ async function Overview({ year, tx, revenue, expense }: { year: number; tx: Tran
 
 async function Budgets({ year, tx, admin, opts, units }: { year: number; tx: Transaction[]; admin: boolean; opts: { id: string; label: string }[]; units: { id: string; name: string; color: string; path: string[]; depth: number }[] }) {
   const supabase = await createClient();
-  const { data } = await supabase.from("budgets").select("*").eq("fiscal_year", year);
-  const budgets = data ?? [];
-  if (!budgets.length) return <EmptyState icon={Wallet} title="Aucun budget défini" description={`Définissez les budgets ${year} de chaque unité.`} action={admin ? <BudgetButton units={opts} year={year} /> : undefined} />;
-  const spentFor = (unitId: string) => tx.filter((t) => t.type === "expense" && t.unit_id && units.find((u) => u.id === t.unit_id)?.path.includes(unitId)).reduce((s, t) => s + Number(t.amount), 0);
-  const totalBudget = budgets.reduce((s, b) => s + Number(b.amount), 0);
+  const [{ data }, { data: projects }] = await Promise.all([
+    supabase.from("budgets").select("*").eq("fiscal_year", year),
+    supabase.from("projects").select("id, name, color").is("archived_at", null).order("name"),
+  ]);
+  const budgets = (data ?? []) as { id: string; unit_id: string | null; project_id: string | null; amount: number; status: "draft" | "active"; notes: string | null }[];
+  const projectOpts = (projects ?? []).map((p) => ({ id: p.id, label: p.name }));
+  const actions = admin ? <BudgetButton units={opts} projects={projectOpts} year={year} /> : undefined;
+  if (!budgets.length) return <EmptyState icon={Wallet} title="Aucun budget défini" description={`Définissez les budgets ${year} des unités et des projets. Un budget reste en brouillon jusqu'à son activation ; au-delà du seuil, l'activation demande l'accord du CEO.`} action={actions} />;
+  const spentFor = (b: (typeof budgets)[number]) => tx.filter((t) => t.type === "expense" && (
+    b.project_id ? t.project_id === b.project_id : t.unit_id && units.find((u) => u.id === t.unit_id)?.path.includes(b.unit_id!)
+  )).reduce((s, t) => s + Number(t.amount), 0);
+  const active = budgets.filter((b) => b.status === "active");
+  const totalBudget = active.reduce((s, b) => s + Number(b.amount), 0);
   const elapsed = year === new Date().getFullYear() ? (new Date().getMonth() + 1) / 12 : year < new Date().getFullYear() ? 1 : 0;
+  const { data: pendingApprovals } = await supabase.from("approval_requests").select("subject_id").eq("kind", "budget").eq("status", "pending");
+  const pendingIds = new Set((pendingApprovals ?? []).map((a) => a.subject_id));
   return (
     <Card>
-      <CardHeader title={`Budgets ${year}`} description={`${money(totalBudget)} alloués · ${Math.round(elapsed * 100)} % de l'exercice écoulé`} action={admin ? <BudgetButton units={opts} year={year} /> : undefined} />
+      <CardHeader title={`Budgets ${year}`} description={`${money(totalBudget)} actifs · ${budgets.length - active.length} en brouillon · ${Math.round(elapsed * 100)} % de l'exercice écoulé`} action={actions} />
       <ul className="divide-y divide-border pt-3">
         {budgets.map((b) => {
           const u = units.find((x) => x.id === b.unit_id);
-          const spent = spentFor(b.unit_id);
+          const p = (projects ?? []).find((x) => x.id === b.project_id);
+          const spent = spentFor(b);
           const ratio = Number(b.amount) ? spent / Number(b.amount) : 0;
           const tone = ratio > 1 ? "bg-rose-500" : ratio > elapsed + 0.1 ? "bg-amber-500" : "bg-emerald-500";
           return (
-            <li key={b.id} className="grid items-center gap-3 px-5 py-4 sm:grid-cols-[220px_1fr_340px]">
-              <span className="flex items-center gap-2.5 font-medium text-fg"><span className="h-2.5 w-2.5 rounded-full" style={{ background: u?.color }} />{u?.name ?? "Unité"}</span>
+            <li key={b.id} className="grid items-center gap-3 px-5 py-4 sm:grid-cols-[240px_1fr_400px]">
+              <span className="flex min-w-0 items-center gap-2.5 font-medium text-fg">
+                <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: u?.color ?? p?.color }} />
+                <span className="truncate">{u?.name ?? (p ? `Projet — ${p.name}` : "Budget")}</span>
+                {b.status === "draft" && <Badge tone={pendingIds.has(b.id) ? "amber" : "neutral"}>{pendingIds.has(b.id) ? "Chez le CEO" : "Brouillon"}</Badge>}
+              </span>
               <div className="relative">
                 <Progress value={ratio * 100} tone={tone} className="h-2" />
                 {elapsed > 0 && elapsed < 1 && <span className="absolute -top-1 h-4 w-0.5 rounded bg-fg/40" style={{ left: `${elapsed * 100}%` }} title="Temps écoulé" />}
@@ -189,7 +213,8 @@ async function Budgets({ year, tx, admin, opts, units }: { year: number; tx: Tra
               <span className="flex items-center justify-end gap-3 text-sm tabular-nums">
                 <span className="whitespace-nowrap text-fg">{money(spent, "XOF", true)} <span className="text-subtle">/ {money(b.amount, "XOF", true)}</span></span>
                 <span className={cn("w-12 text-right font-medium", ratio > 1 ? "text-danger" : "text-muted")}>{Math.round(ratio * 100)} %</span>
-                {admin && <BudgetButton units={opts} year={year} unitId={b.unit_id} amount={Number(b.amount)} />}
+                {admin && b.status === "draft" && !pendingIds.has(b.id) && <ActivateBudget id={b.id} />}
+                {admin && !pendingIds.has(b.id) && <BudgetButton units={opts} projects={projectOpts} year={year} unitId={b.unit_id ?? undefined} projectId={b.project_id ?? undefined} amount={Number(b.amount)} />}
               </span>
             </li>
           );

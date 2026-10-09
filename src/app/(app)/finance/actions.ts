@@ -23,30 +23,50 @@ export async function addTransaction(_: ActionResult | null, fd: FormData): Prom
     description: str(fd, "description"),
     unit_id: str(fd, "unit_id"), project_id: str(fd, "project_id"), account_id: str(fd, "account_id"),
     product: str(fd, "product"), country: str(fd, "country"), reference: str(fd, "reference"),
+    approval_id: type === "expense" ? str(fd, "approval_id") : null,
   });
   if (error) return fail(error);
   refresh();
+  revalidatePath("/validations");
   return ok(type === "revenue" ? "Revenu enregistré." : "Dépense enregistrée.");
 }
 
-export async function deleteTransaction(id: string): Promise<ActionResult> {
+/** Annule une opération par une écriture inverse : rien ne s'efface. */
+export async function reverseTransaction(id: string, reason: string): Promise<ActionResult> {
   const supabase = await createClient();
-  const { error } = await supabase.from("transactions").delete().eq("id", id);
+  const { error } = await supabase.rpc("reverse_transaction", { p_id: id, p_reason: reason });
   if (error) return fail(error);
   refresh();
-  return ok("Opération supprimée.");
+  return ok("Opération contre-passée : l'écriture inverse est enregistrée.");
 }
 
+/** Enregistre (ou modifie) un budget : toujours en brouillon, l'activation est un acte distinct. */
 export async function setBudget(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
   const unit = str(fd, "unit_id");
+  const project = str(fd, "project_id");
   const year = numVal(fd, "fiscal_year");
   const amount = numVal(fd, "amount");
-  if (!unit || !year || amount === null) return fail("Unité, exercice et montant requis.");
+  if ((!unit && !project) || !year || amount === null) return fail("Unité ou projet, exercice et montant requis.");
   const supabase = await createClient();
-  const { error } = await supabase.from("budgets").upsert({ unit_id: unit, fiscal_year: year, amount, notes: str(fd, "notes") }, { onConflict: "unit_id,fiscal_year" });
+  let query = supabase.from("budgets").select("id").eq("fiscal_year", year);
+  query = project ? query.eq("project_id", project) : query.eq("unit_id", unit!);
+  const { data: existing } = await query.maybeSingle();
+  const row = { amount, notes: str(fd, "notes"), status: "draft" as const };
+  const { error } = existing
+    ? await supabase.from("budgets").update(row).eq("id", existing.id)
+    : await supabase.from("budgets").insert({ ...row, fiscal_year: year, unit_id: project ? null : unit, project_id: project });
   if (error) return fail(error);
   refresh();
-  return ok("Budget enregistré.");
+  return ok("Budget enregistré en brouillon : activez-le pour qu'il s'applique.");
+}
+
+export async function activateBudget(id: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("activate_budget", { p_budget: id, p_justification: null });
+  if (error) return fail(error);
+  refresh();
+  revalidatePath("/validations");
+  return ok(data === "active" ? "Budget activé." : "Budget au-delà du seuil : demande d'accord transmise au CEO.");
 }
 
 export async function createInvoice(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
@@ -65,14 +85,21 @@ export async function createInvoice(_: ActionResult | null, fd: FormData): Promi
   if (error) return fail(error);
   const desc = str(fd, "line_description");
   const price = numVal(fd, "line_amount");
-  if (desc && price) await supabase.from("invoice_lines").insert({ invoice_id: data.id, description: desc, quantity: 1, unit_price: price });
+  if (desc && price) {
+    const { error: lineError } = await supabase.from("invoice_lines").insert({ invoice_id: data.id, description: desc, quantity: 1, unit_price: price });
+    if (lineError) return fail(`Facture créée, mais la première ligne n'a pas pu être ajoutée : ${lineError.message}`);
+  }
   refresh();
   return ok("Facture créée.", data);
 }
 
-export async function updateInvoice(id: string, patch: Record<string, unknown>): Promise<ActionResult> {
+type InvoicePatch = Partial<{ status: InvoiceStatus; due_date: string; notes: string | null; account_id: string; tax_rate: number }>;
+const INVOICE_PATCH_KEYS = new Set(["status", "due_date", "notes", "account_id", "tax_rate"]);
+
+export async function updateInvoice(id: string, patch: InvoicePatch): Promise<ActionResult> {
+  const clean = Object.fromEntries(Object.entries(patch).filter(([k]) => INVOICE_PATCH_KEYS.has(k)));
   const supabase = await createClient();
-  const { error } = await supabase.from("invoices").update(patch).eq("id", id);
+  const { error } = await supabase.from("invoices").update(clean).eq("id", id);
   if (error) return fail(error);
   refresh(id);
   return ok();

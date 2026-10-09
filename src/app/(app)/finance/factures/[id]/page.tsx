@@ -30,7 +30,7 @@ export default async function InvoicePage({ params }: { params: Promise<{ id: st
         <PageHeader
           crumbs={[{ label: "Finance", href: "/finance?onglet=factures" }, { label: inv.number }]}
           title={<span className="flex items-center gap-3">Facture {inv.number} <LabelBadge map={invoiceStatus} value={inv.status} /></span>}
-          actions={<InvoiceActions id={inv.id} status={inv.status} admin={admin} />}
+          actions={<InvoiceActions id={inv.id} status={inv.status} admin={admin} everSent={Boolean((inv as { sent_at?: string | null }).sent_at)} />}
         />
       </div>
       <div className="mx-auto max-w-4xl rounded-2xl border border-border bg-surface p-8 shadow-card print:max-w-none print:border-0 print:p-0 print:shadow-none sm:p-12">

@@ -1,6 +1,6 @@
 -- =============================================================================
 -- VERIION OS — Installation complète (migrations + données initiales)
--- Généré à partir de supabase/migrations/*.sql et supabase/seed.sql.
+-- Généré à partir de supabase/migrations/*.sql et supabase/seed.sql (npm run build:install).
 -- Collez ce fichier dans Supabase > SQL Editor et exécutez-le UNE fois.
 -- =============================================================================
 
@@ -5115,6 +5115,1568 @@ do $$ declare r record; begin
     perform public.sync_auto_grants(r.id);
   end loop;
 end $$;
+
+-- >>>>>>>>>> supabase/migrations/20261012000011_p0_gouvernance.sql
+-- =============================================================================
+-- VERIION OS — Migration 11 : gouvernance fiable (phase 0, lots P0-01 à P0-05, P0-07)
+-- =============================================================================
+-- Corrige les contournements mis en évidence par l'audit du 9 octobre 2026 :
+--   P0-01  le seuil des validations et les paramètres de gouvernance ne sont
+--          modifiables que par le CEO ;
+--   P0-02  personne d'autre que le CEO ne peut suspendre, rétrograder ou faire
+--          partir un CEO ; la succession passe par transfer_ceo() ;
+--   P0-03  les permissions sensibles ne s'accordent que sur décision du CEO, et
+--          toute dérogation a une durée plafonnée ;
+--   P0-04  un accord porte sur un contenu figé (instantané + empreinte), se
+--          consomme au fil des dépenses, ne peut pas être donné par le
+--          demandeur lui-même, et le CEO laisse lui aussi une décision tracée ;
+--   P0-05  le titulaire d'une tâche ne peut plus lever sa propre vérification ;
+--   P0-07  les opérations sensibles exigent la double authentification (aal2).
+-- Rejouable : tout est conditionné.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 0. Correctif : la séquence des contrats juridiques n'était pas accordée.
+-- -----------------------------------------------------------------------------
+grant usage, select on sequence public.legal_contract_seq to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- P0-01. Paramètres de gouvernance (CEO uniquement)
+-- -----------------------------------------------------------------------------
+create table if not exists public.governance_settings (
+  id                      boolean primary key default true check (id),
+  ceo_approval_threshold  numeric(16,2) not null default 500000 check (ceo_approval_threshold >= 0),
+  approval_reminder_days  int not null default 2  check (approval_reminder_days between 1 and 30),
+  max_grant_days          int not null default 90 check (max_grant_days between 1 and 366),
+  mfa_enforced            boolean not null default true,
+  updated_at              timestamptz not null default now(),
+  updated_by              uuid references public.profiles(id) on delete set null
+);
+
+do $$
+begin
+  if not exists (select 1 from public.governance_settings) then
+    insert into public.governance_settings (ceo_approval_threshold)
+    select coalesce((select ceo_approval_threshold from public.company_settings where id), 500000);
+  end if;
+end $$;
+
+-- Le seuil quitte company_settings (modifiable par les administrateurs).
+create or replace function public.ceo_approval_threshold()
+returns numeric language sql stable security definer set search_path = public as $$
+  select coalesce((select ceo_approval_threshold from public.governance_settings where id), 500000)
+$$;
+alter table public.company_settings drop column if exists ceo_approval_threshold;
+
+-- Double authentification : niveau aal2 exigé pour les opérations sensibles.
+-- Les traitements serveur (service role, tâches planifiées) n'ont pas d'utilisateur.
+create or replace function public.mfa_ok()
+returns boolean language sql stable security definer set search_path = public as $$
+  select auth.uid() is null
+      or not coalesce((select mfa_enforced from public.governance_settings where id), true)
+      or coalesce(auth.jwt()->>'aal', 'aal1') = 'aal2'
+$$;
+grant execute on function public.mfa_ok() to authenticated;
+
+create or replace function public.require_mfa()
+returns void language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.mfa_ok() then
+    raise exception 'Double authentification requise pour cette opération : validez votre code de sécurité.' using errcode = '42501';
+  end if;
+end $$;
+grant execute on function public.require_mfa() to authenticated;
+
+create or replace function public.governance_settings_touch()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  new.updated_at := now();
+  new.updated_by := auth.uid();
+  return new;
+end $$;
+drop trigger if exists governance_settings_touch_bu on public.governance_settings;
+create trigger governance_settings_touch_bu before update on public.governance_settings
+  for each row execute function public.governance_settings_touch();
+drop trigger if exists audit_governance_settings on public.governance_settings;
+create trigger audit_governance_settings after update on public.governance_settings
+  for each row execute function public.audit_trigger();
+
+alter table public.governance_settings enable row level security;
+revoke all on public.governance_settings from anon;
+grant select, update on public.governance_settings to authenticated;
+drop policy if exists "gouvernance: lecture" on public.governance_settings;
+create policy "gouvernance: lecture" on public.governance_settings for select to authenticated
+  using (public.is_active_user());
+drop policy if exists "gouvernance: modification" on public.governance_settings;
+create policy "gouvernance: modification" on public.governance_settings for update to authenticated
+  using (public.is_ceo() and public.mfa_ok()) with check (public.is_ceo() and public.mfa_ok());
+
+-- -----------------------------------------------------------------------------
+-- P0-02. Protection du compte CEO
+-- -----------------------------------------------------------------------------
+create or replace function public.profiles_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then return new; end if;  -- service role / SQL editor
+  if not public.has_perm('users.admin') then
+    if new.system_role is distinct from old.system_role
+       or new.status is distinct from old.status
+       or new.email is distinct from old.email
+       or new.hire_date is distinct from old.hire_date then
+      raise exception 'Seuls les administrateurs peuvent modifier ce champ' using errcode = '42501';
+    end if;
+    if (new.manager_id is distinct from old.manager_id or new.primary_unit_id is distinct from old.primary_unit_id)
+       and not public.manages_profile(old.id) then
+      raise exception 'Seul un responsable peut modifier le rattachement' using errcode = '42501';
+    end if;
+  end if;
+  -- Le compte du CEO n'est modifiable, sur ces champs, que par un CEO.
+  if old.system_role = 'ceo'
+     and (new.system_role is distinct from old.system_role or new.status is distinct from old.status)
+     and not public.is_ceo() then
+    raise exception 'Seul le CEO peut modifier le statut ou le rôle d''un CEO' using errcode = '42501';
+  end if;
+  if new.system_role = 'ceo' and old.system_role <> 'ceo' and not public.is_ceo() then
+    raise exception 'Seul le CEO peut désigner un CEO' using errcode = '42501';
+  end if;
+  if (new.system_role is distinct from old.system_role or new.status is distinct from old.status) then
+    perform public.require_mfa();
+  end if;
+  return new;
+end $$;
+
+/** Succession : le CEO transmet sa fonction et devient administrateur. */
+create or replace function public.transfer_ceo(p_to uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_ceo() then raise exception 'Seul le CEO peut transmettre sa fonction' using errcode = '42501'; end if;
+  perform public.require_mfa();
+  if p_to = auth.uid() then raise exception 'Choisissez une autre personne'; end if;
+  if not exists (select 1 from public.profiles where id = p_to and status = 'active') then
+    raise exception 'Successeur introuvable ou inactif';
+  end if;
+  update public.profiles set system_role = 'ceo' where id = p_to;
+  update public.profiles set system_role = 'admin' where id = auth.uid();
+  perform public.notify(p_to, 'governance.ceo', 'Vous êtes désormais CEO de VERIION', null, '/');
+end $$;
+revoke execute on function public.transfer_ceo(uuid) from public, anon;
+grant execute on function public.transfer_ceo(uuid) to authenticated;
+
+create or replace function public.offboard_employee(p_profile uuid, p_date date default current_date)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_manager uuid; v_name text; v_role public.system_role;
+begin
+  if not public.has_perm('users.admin') then raise exception 'Permission refusée' using errcode = '42501'; end if;
+  perform public.require_mfa();
+  if p_profile = auth.uid() then raise exception 'Vous ne pouvez pas vous désactiver vous-même'; end if;
+  select manager_id, full_name, system_role into v_manager, v_name, v_role from public.profiles where id = p_profile;
+  if v_role = 'ceo' then
+    raise exception 'Le départ d''un CEO passe d''abord par la transmission de sa fonction' using errcode = '42501';
+  end if;
+
+  update public.unit_memberships set end_date = greatest(start_date, p_date) where profile_id = p_profile and end_date is null;
+  delete from public.role_grants where profile_id = p_profile and source = 'manual';
+  update public.tasks set assignee_id = null where assignee_id = p_profile and status <> 'done';
+  update public.profiles set status = 'offboarded' where id = p_profile;
+
+  insert into public.lifecycle_items (profile_id, kind, title, position, due_date, assignee_id) values
+    (p_profile, 'offboarding', 'Récupérer le matériel',                      1, p_date, v_manager),
+    (p_profile, 'offboarding', 'Transférer les dossiers et documents',       2, p_date, v_manager),
+    (p_profile, 'offboarding', 'Réattribuer les tâches ouvertes',            3, p_date, v_manager),
+    (p_profile, 'offboarding', 'Solde de tout compte',                       4, p_date + 15, null),
+    (p_profile, 'offboarding', 'Entretien de départ',                        5, p_date, v_manager);
+
+  perform public.notify(v_manager, 'hr.offboarding', 'Départ de ' || coalesce(v_name, 'un collaborateur'),
+    'Ses tâches ouvertes ont été désassignées. Checklist de départ créée.', '/rh?onglet=parcours');
+end $$;
+
+create or replace function public.clear_access_code(p_profile uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.has_perm('users.admin') then
+    raise exception 'Action réservée aux administrateurs' using errcode = '42501';
+  end if;
+  perform public.require_mfa();
+  if exists (select 1 from public.profiles where id = p_profile and system_role = 'ceo') and not public.is_ceo() then
+    raise exception 'Seul le CEO peut réinitialiser le code d''un CEO' using errcode = '42501';
+  end if;
+  delete from public.access_codes where profile_id = p_profile;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- P0-03. Permissions réservées et dérogations encadrées
+-- -----------------------------------------------------------------------------
+alter table public.permissions add column if not exists reserved boolean not null default false;
+update public.permissions set reserved = true
+ where key in ('approvals.decide', 'finance.admin', 'finance.view', 'hr.admin', 'docs.confidential', 'grants.manage', 'dashboard.exec');
+
+create or replace function public.permission_reserved(p_perm text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select reserved from public.permissions where key = p_perm), true)
+$$;
+
+create or replace function public.max_grant_days()
+returns int language sql stable security definer set search_path = public as $$
+  select coalesce((select max_grant_days from public.governance_settings where id), 90)
+$$;
+
+drop policy if exists "grants: dérogation" on public.role_grants;
+create policy "grants: dérogation" on public.role_grants for insert to authenticated
+  with check (
+    public.has_perm('grants.manage') and public.mfa_ok()
+    and source = 'manual' and granted_by = auth.uid() and profile_id <> auth.uid()
+    and (not public.permission_reserved(permission) or public.is_ceo())
+    and expires_at is not null
+    and expires_at > now()
+    and expires_at <= now() + make_interval(days => public.max_grant_days()) + interval '1 hour'
+  );
+drop policy if exists "grants: révocation" on public.role_grants;
+create policy "grants: révocation" on public.role_grants for delete to authenticated
+  using (public.has_perm('grants.manage') and source = 'manual' and public.mfa_ok());
+
+drop policy if exists "templates: gestion" on public.role_templates;
+create policy "templates: gestion" on public.role_templates for all to authenticated
+  using (public.is_ceo() and public.mfa_ok()) with check (public.is_ceo() and public.mfa_ok());
+
+-- dashboard.exec ouvrait toute la finance, le CRM et tous les projets aux
+-- responsables Juridique et RH : il revient à la Direction (et au CFO).
+delete from public.role_templates where permission = 'dashboard.exec' and domain in ('legal', 'hr');
+
+-- -----------------------------------------------------------------------------
+-- P0-04. Validations : instantané, empreinte, consommation, séparation des tâches
+-- -----------------------------------------------------------------------------
+alter table public.approval_requests
+  add column if not exists subject_snapshot jsonb,
+  add column if not exists subject_hash     text,
+  add column if not exists consumed_amount  numeric(16,2) not null default 0,
+  add column if not exists direct_decision  boolean not null default false;
+
+-- Champs couverts par l'accord, selon le type de sujet. Toute modification de
+-- l'un d'eux rend l'accord caduc.
+create or replace function public.approval_snapshot(p_kind public.approval_kind, p_row jsonb)
+returns jsonb language sql immutable as $$
+  select case p_kind
+    when 'budget' then jsonb_build_object(
+      'unit_id', p_row->'unit_id', 'project_id', p_row->'project_id',
+      'fiscal_year', p_row->'fiscal_year', 'amount', p_row->'amount', 'currency', p_row->'currency')
+    when 'legal_contract' then jsonb_build_object(
+      'title', p_row->'title', 'type', p_row->'type', 'counterparty', p_row->'counterparty',
+      'amount', p_row->'amount', 'currency', p_row->'currency', 'effective_date', p_row->'effective_date',
+      'end_date', p_row->'end_date', 'auto_renew', p_row->'auto_renew', 'document_id', p_row->'document_id',
+      'obligations', p_row->'obligations')
+    when 'employment_contract' then jsonb_build_object(
+      'profile_id', p_row->'profile_id', 'type', p_row->'type', 'job_title', p_row->'job_title',
+      'start_date', p_row->'start_date', 'end_date', p_row->'end_date', 'weekly_hours', p_row->'weekly_hours',
+      'gross_monthly', p_row->'gross_monthly')
+    when 'project' then jsonb_build_object(
+      'name', p_row->'name', 'unit_id', p_row->'unit_id', 'budget', p_row->'budget', 'lead_id', p_row->'lead_id')
+    when 'operation_cycle' then jsonb_build_object(
+      'project_id', p_row->'project_id', 'kind', p_row->'kind',
+      'period_start', p_row->'period_start', 'period_end', p_row->'period_end')
+    else null
+  end
+$$;
+
+create or replace function public.approval_hash(p_kind public.approval_kind, p_row jsonb)
+returns text language sql immutable as $$
+  select case when public.approval_snapshot(p_kind, p_row) is null then null
+              else encode(extensions.digest(public.approval_snapshot(p_kind, p_row)::text, 'sha256'), 'hex') end
+$$;
+
+-- Ligne courante du sujet, sous forme JSON.
+create or replace function public.approval_subject_row(p_kind public.approval_kind, p_subject uuid)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare r jsonb;
+begin
+  case p_kind
+    when 'budget'              then select to_jsonb(b) into r from public.budgets b where b.id = p_subject;
+    when 'legal_contract'      then select to_jsonb(c) into r from public.legal_contracts c where c.id = p_subject;
+    when 'employment_contract' then select to_jsonb(c) into r from public.employment_contracts c where c.id = p_subject;
+    when 'project'             then select to_jsonb(p) into r from public.projects p where p.id = p_subject;
+    when 'operation_cycle'     then select to_jsonb(c) into r from public.operation_cycles c where c.id = p_subject;
+    else r := null;
+  end case;
+  return r;
+end $$;
+
+/** Accord valide pour exactement ce contenu ? */
+create or replace function public.approval_valid(p_kind public.approval_kind, p_subject uuid, p_row jsonb)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.approval_requests
+     where kind = p_kind and subject_id = p_subject and status = 'approved'
+       and subject_hash is not distinct from public.approval_hash(p_kind, p_row)
+  )
+$$;
+
+create or replace function public.approval_granted(p_kind public.approval_kind, p_subject uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.approval_valid(p_kind, p_subject, public.approval_subject_row(p_kind, p_subject))
+$$;
+
+create or replace function public.approval_pending(p_kind public.approval_kind, p_subject uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.approval_requests where kind = p_kind and subject_id = p_subject and status = 'pending')
+$$;
+
+/** Qui peut demander un accord pour ce sujet ; libellé, montant et rattachements dérivés du sujet. */
+create or replace function public.approval_subject_info(p_kind public.approval_kind, p_subject uuid,
+  out allowed boolean, out label text, out amount numeric, out currency text, out unit_id uuid, out project_id uuid)
+language plpgsql stable security definer set search_path = public as $$
+declare r jsonb := public.approval_subject_row(p_kind, p_subject);
+begin
+  allowed := false;
+  if r is null then return; end if;
+  currency := coalesce(r->>'currency', 'XOF');
+  case p_kind
+    when 'budget' then
+      allowed := public.has_perm('finance.admin')
+              or ((r->>'unit_id') is not null and public.has_perm('unit.manage', (r->>'unit_id')::uuid))
+              or ((r->>'project_id') is not null and public.can_manage_project((r->>'project_id')::uuid));
+      amount := (r->>'amount')::numeric;
+      unit_id := (r->>'unit_id')::uuid; project_id := (r->>'project_id')::uuid;
+      label := 'Budget ' || (r->>'fiscal_year') || ' — ' || coalesce(
+        (select name from public.org_units where id = (r->>'unit_id')::uuid),
+        (select name from public.projects where id = (r->>'project_id')::uuid), 'sans rattachement');
+    when 'legal_contract' then
+      allowed := public.has_perm('legal.admin') or (r->>'owner_id')::uuid = auth.uid();
+      amount := (r->>'amount')::numeric;
+      unit_id := (r->>'unit_id')::uuid; project_id := (r->>'project_id')::uuid;
+      label := 'Contrat ' || (r->>'reference') || ' — ' || (r->>'title') || ' (' || (r->>'counterparty') || ')';
+    when 'employment_contract' then
+      allowed := public.has_perm('hr.admin');
+      amount := (r->>'gross_monthly')::numeric;
+      label := 'Contrat de travail — ' || coalesce((select full_name from public.profiles where id = (r->>'profile_id')::uuid), '?')
+               || coalesce(' · ' || (r->>'job_title'), '') || ' (' || upper(r->>'type') || ')';
+    when 'project' then
+      allowed := public.can_manage_project(p_subject);
+      amount := (r->>'budget')::numeric;
+      unit_id := (r->>'unit_id')::uuid; project_id := p_subject;
+      label := 'Lancement du projet ' || (r->>'name');
+    when 'operation_cycle' then
+      allowed := public.can_plan_project((r->>'project_id')::uuid);
+      project_id := (r->>'project_id')::uuid;
+      label := 'Calendrier mensuel — ' || coalesce((select name from public.projects where id = (r->>'project_id')::uuid), 'projet')
+               || ' (' || to_char((r->>'period_start')::date, 'MM/YYYY') || ')';
+    else
+      allowed := false;
+  end case;
+end $$;
+
+/** Décision directe du CEO : tracée dans le registre comme un accord auto-approuvé. */
+create or replace function public.record_ceo_decision(p_kind public.approval_kind, p_subject uuid, p_row jsonb, p_note text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare v_id uuid; info record;
+begin
+  select * into info from public.approval_subject_info(p_kind, p_subject);
+  update public.approval_requests set status = 'cancelled'
+   where kind = p_kind and subject_id = p_subject and status = 'pending';
+  insert into public.approval_requests (kind, subject_id, subject_label, amount, currency, unit_id, project_id,
+                                        status, requested_by, decided_by, decided_at, decision_note,
+                                        subject_snapshot, subject_hash, direct_decision)
+  values (p_kind, p_subject, coalesce(info.label, p_kind::text), info.amount, coalesce(info.currency, 'XOF'),
+          info.unit_id, info.project_id, 'approved', auth.uid(), auth.uid(), now(),
+          coalesce(p_note, 'Décision directe du CEO'),
+          public.approval_snapshot(p_kind, p_row), public.approval_hash(p_kind, p_row), true)
+  returning id into v_id;
+  return v_id;
+end $$;
+revoke execute on function public.record_ceo_decision(public.approval_kind, uuid, jsonb, text) from public, anon, authenticated;
+
+/**
+ * Garde commune : l'opération engageante n'est permise qu'avec un accord valide
+ * pour ce contenu. Le CEO passe, mais sa décision est enregistrée.
+ */
+create or replace function public.require_approval(p_kind public.approval_kind, p_subject uuid, p_row jsonb, p_message text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then return; end if;
+  if public.approval_valid(p_kind, p_subject, p_row) then return; end if;
+  if public.is_ceo() then
+    perform public.record_ceo_decision(p_kind, p_subject, p_row);
+    return;
+  end if;
+  raise exception '%', p_message using errcode = '42501';
+end $$;
+revoke execute on function public.require_approval(public.approval_kind, uuid, jsonb, text) from public, anon, authenticated;
+
+/** Pendant l'attente d'une décision, le contenu soumis est gelé. */
+create or replace function public.approval_freeze(p_kind public.approval_kind, p_subject uuid, p_old jsonb, p_new jsonb)
+returns void language plpgsql stable security definer set search_path = public as $$
+begin
+  if auth.uid() is not null
+     and public.approval_hash(p_kind, p_old) is distinct from public.approval_hash(p_kind, p_new)
+     and public.approval_pending(p_kind, p_subject) then
+    raise exception 'Une demande d''accord est en cours sur ce contenu : retirez-la avant de le modifier.' using errcode = '42501';
+  end if;
+end $$;
+revoke execute on function public.approval_freeze(public.approval_kind, uuid, jsonb, jsonb) from public, anon, authenticated;
+
+/** Soumet une décision au CEO. Renvoie la demande déjà en attente s'il y en a une. */
+create or replace function public.request_approval(
+  p_kind public.approval_kind, p_subject uuid, p_label text,
+  p_amount numeric default null, p_justification text default null,
+  p_unit uuid default null, p_project uuid default null
+) returns uuid language plpgsql security definer set search_path = public as $$
+declare v_id uuid; r record; info record; v_row jsonb; v_label text; v_amount numeric; v_currency text := 'XOF';
+begin
+  if not public.is_active_user() then raise exception 'Compte inactif' using errcode = '42501'; end if;
+
+  select id into v_id from public.approval_requests
+   where kind = p_kind and subject_id = p_subject and status = 'pending' and p_subject is not null;
+  if v_id is not null then return v_id; end if;
+
+  v_row := case when p_subject is not null then public.approval_subject_row(p_kind, p_subject) end;
+  if public.approval_snapshot(p_kind, '{}'::jsonb) is not null then
+    -- Sujet réel : la base, et non le demandeur, décrit ce qui est soumis.
+    if v_row is null then raise exception 'Objet de la demande introuvable'; end if;
+    select * into info from public.approval_subject_info(p_kind, p_subject);
+    if not info.allowed then
+      raise exception 'Seul le responsable de cet objet peut en demander l''accord' using errcode = '42501';
+    end if;
+    v_label := info.label; v_amount := info.amount; v_currency := coalesce(info.currency, 'XOF');
+    p_unit := info.unit_id; p_project := info.project_id;
+  else
+    -- Dépense ou décision libre : décrite par le demandeur.
+    if length(trim(coalesce(p_label, ''))) < 3 then raise exception 'Précisez l''objet de la demande'; end if;
+    v_label := trim(p_label); v_amount := p_amount;
+    if p_kind = 'expense' and coalesce(p_amount, 0) <= 0 then raise exception 'Indiquez le montant de la dépense'; end if;
+  end if;
+
+  -- Le CEO décide directement : sa demande est enregistrée comme décision.
+  if public.is_ceo() then
+    if v_row is not null then
+      return public.record_ceo_decision(p_kind, p_subject, v_row, nullif(trim(coalesce(p_justification, '')), ''));
+    end if;
+    insert into public.approval_requests (kind, subject_id, subject_label, amount, currency, justification, unit_id, project_id,
+                                          status, requested_by, decided_by, decided_at, decision_note, direct_decision)
+    values (p_kind, p_subject, v_label, v_amount, v_currency, nullif(trim(coalesce(p_justification, '')), ''), p_unit, p_project,
+            'approved', auth.uid(), auth.uid(), now(), 'Décision directe du CEO', true)
+    returning id into v_id;
+    return v_id;
+  end if;
+
+  insert into public.approval_requests (kind, subject_id, subject_label, amount, currency, justification, unit_id, project_id,
+                                        subject_snapshot, subject_hash)
+  values (p_kind, p_subject, v_label, v_amount, v_currency, nullif(trim(coalesce(p_justification, '')), ''), p_unit, p_project,
+          public.approval_snapshot(p_kind, v_row), public.approval_hash(p_kind, v_row))
+  returning id into v_id;
+
+  for r in
+    select p.id from public.profiles p where p.status = 'active' and p.system_role = 'ceo'
+    union
+    select g.profile_id from public.role_grants g
+     where g.permission = 'approvals.decide' and (g.expires_at is null or g.expires_at > now())
+  loop
+    if r.id is distinct from auth.uid() then
+      perform public.notify(r.id, 'approval.requested', 'Décision attendue : ' || v_label,
+        case when v_amount is not null then to_char(v_amount, 'FM999G999G999G990') || ' ' || v_currency else null end,
+        '/validations?demande=' || v_id);
+    end if;
+  end loop;
+  return v_id;
+end $$;
+
+/** Accord ou refus : jamais sur sa propre demande, toujours motivé côté refus. */
+create or replace function public.decide_approval(p_id uuid, p_approve boolean, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare a public.approval_requests; v_row jsonb;
+begin
+  if not public.can_decide_approvals() then
+    raise exception 'Cette décision revient au CEO' using errcode = '42501';
+  end if;
+  perform public.require_mfa();
+  select * into a from public.approval_requests where id = p_id for update;
+  if a.id is null then raise exception 'Demande introuvable'; end if;
+  if a.status <> 'pending' then raise exception 'Cette demande a déjà été traitée'; end if;
+  if a.requested_by = auth.uid() then
+    raise exception 'Vous ne pouvez pas statuer sur votre propre demande' using errcode = '42501';
+  end if;
+  if not p_approve and length(trim(coalesce(p_note, ''))) < 3 then
+    raise exception 'Motivez le refus : la personne doit savoir quoi corriger';
+  end if;
+  -- Le contenu a-t-il changé depuis la demande ? (gel contourné par le service role, par ex.)
+  if p_approve and a.subject_id is not null and a.subject_hash is not null then
+    v_row := public.approval_subject_row(a.kind, a.subject_id);
+    if public.approval_hash(a.kind, v_row) is distinct from a.subject_hash then
+      raise exception 'Le contenu a changé depuis la demande : elle doit être soumise à nouveau.';
+    end if;
+  end if;
+
+  update public.approval_requests
+     set status = case when p_approve then 'approved' else 'rejected' end::public.approval_status,
+         decided_by = auth.uid(), decided_at = now(), decision_note = nullif(trim(coalesce(p_note, '')), '')
+   where id = p_id;
+
+  perform public.notify(a.requested_by,
+    case when p_approve then 'approval.approved' else 'approval.rejected' end,
+    case when p_approve then 'Accord : ' else 'Refus : ' end || a.subject_label,
+    nullif(trim(coalesce(p_note, '')), ''), '/validations?demande=' || a.id);
+end $$;
+
+-- Budgets : activation au-delà du seuil soumise à un accord sur ce montant précis.
+create or replace function public.budgets_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'UPDATE' then
+    perform public.approval_freeze('budget', new.id, to_jsonb(old), to_jsonb(new));
+  end if;
+  if new.status = 'active' and new.amount > public.ceo_approval_threshold() then
+    perform public.require_approval('budget', new.id, to_jsonb(new),
+      'Ce budget dépasse le seuil : l''accord du CEO sur ce montant est requis avant activation.');
+  end if;
+  return new;
+end $$;
+
+-- Dépenses : un accord se consomme ; au-delà du seuil, il est obligatoire.
+create or replace function public.transactions_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare a public.approval_requests; v_cum numeric; r record;
+begin
+  if tg_op <> 'INSERT' or new.type <> 'expense' or new.amount <= 0 then return new; end if;
+
+  if new.approval_id is not null then
+    select * into a from public.approval_requests where id = new.approval_id for update;
+    if a.id is null or a.kind <> 'expense' or a.status <> 'approved' then
+      raise exception 'L''accord indiqué n''est pas un accord de dépense valide.' using errcode = '42501';
+    end if;
+    if a.consumed_amount + new.amount > coalesce(a.amount, 0) then
+      raise exception 'Accord insuffisant : % XOF déjà engagés sur % accordés.',
+        to_char(a.consumed_amount, 'FM999G999G999G990'), to_char(coalesce(a.amount, 0), 'FM999G999G999G990')
+        using errcode = '42501';
+    end if;
+    update public.approval_requests set consumed_amount = consumed_amount + new.amount where id = a.id;
+  elsif auth.uid() is not null and new.amount > public.ceo_approval_threshold() then
+    if public.is_ceo() then
+      insert into public.approval_requests (kind, subject_label, amount, currency, status, requested_by, decided_by,
+                                            decided_at, decision_note, consumed_amount, direct_decision)
+      values ('expense', coalesce(new.description, new.category), new.amount, new.currency, 'approved',
+              auth.uid(), auth.uid(), now(), 'Décision directe du CEO', new.amount, true)
+      returning id into new.approval_id;
+    else
+      raise exception 'Dépense au-dessus du seuil : rattachez-la à un accord du CEO portant au moins ce montant.' using errcode = '42501';
+    end if;
+  elsif auth.uid() is not null then
+    -- Contrôle anti-fractionnement : alerte (sans blocage) si les dépenses
+    -- d'un même objet dépassent le seuil sur 30 jours.
+    select coalesce(sum(t.amount), 0) + new.amount into v_cum
+      from public.transactions t
+     where t.type = 'expense' and t.amount > 0 and t.approval_id is null
+       and t.occurred_on > new.occurred_on - 30
+       and (t.category = new.category or (new.account_id is not null and t.account_id = new.account_id));
+    if v_cum > public.ceo_approval_threshold() then
+      for r in select p.id from public.profiles p where p.status = 'active' and p.system_role = 'ceo' loop
+        perform public.notify(r.id, 'approval.split_alert', 'Dépenses cumulées au-dessus du seuil',
+          'Catégorie « ' || new.category || ' » : ' || to_char(v_cum, 'FM999G999G999G990') || ' XOF sur 30 jours sans accord.',
+          '/finance?onglet=operations');
+      end loop;
+    end if;
+  end if;
+  return new;
+end $$;
+
+create or replace function public.projects_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'UPDATE' then
+    perform public.approval_freeze('project', new.id, to_jsonb(old), to_jsonb(new));
+  end if;
+  if new.status = 'active' and (tg_op = 'INSERT' or old.status <> 'active') then
+    perform public.require_approval('project', new.id, to_jsonb(new),
+      'Le lancement d''un projet demande l''accord du CEO. Soumettez-le depuis la fiche du projet.');
+    new.approved_at := coalesce(new.approved_at, now());
+    new.approved_by := coalesce(new.approved_by, auth.uid());
+  end if;
+  return new;
+end $$;
+
+alter table public.employment_contracts add column if not exists gross_monthly numeric(14,2) check (gross_monthly is null or gross_monthly >= 0);
+
+create or replace function public.employment_contracts_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'UPDATE' then
+    perform public.approval_freeze('employment_contract', new.id, to_jsonb(old), to_jsonb(new));
+    if old.status in ('signed', 'ended') and auth.uid() is not null
+       and public.approval_hash('employment_contract', to_jsonb(old)) is distinct from public.approval_hash('employment_contract', to_jsonb(new)) then
+      raise exception 'Un contrat signé ne se modifie pas : établissez un avenant (nouveau contrat).' using errcode = '42501';
+    end if;
+  end if;
+  if new.status = 'signed' and (tg_op = 'INSERT' or old.status <> 'signed') then
+    perform public.require_approval('employment_contract', new.id, to_jsonb(new),
+      'La signature d''un contrat de travail demande l''accord du CEO.');
+    new.approved_at := coalesce(new.approved_at, now());
+    new.approved_by := coalesce(new.approved_by, auth.uid());
+  end if;
+  return new;
+end $$;
+
+-- Le salaire convenu s'applique à la signature, pas avant.
+create or replace function public.employment_contracts_after_sign()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'signed' and (tg_op = 'INSERT' or old.status <> 'signed') and new.gross_monthly is not null then
+    insert into public.salaries (profile_id, gross_monthly, effective_from, notes, created_by)
+    values (new.profile_id, new.gross_monthly, new.start_date, 'Contrat signé', auth.uid());
+  end if;
+  return null;
+end $$;
+drop trigger if exists employment_contracts_after_sign_aiu on public.employment_contracts;
+create trigger employment_contracts_after_sign_aiu after insert or update on public.employment_contracts
+  for each row execute function public.employment_contracts_after_sign();
+
+create or replace function public.legal_contracts_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'UPDATE' then
+    perform public.approval_freeze('legal_contract', new.id, to_jsonb(old), to_jsonb(new));
+    if old.status in ('signed', 'active', 'expired', 'terminated') and auth.uid() is not null
+       and public.approval_hash('legal_contract', to_jsonb(old)) is distinct from public.approval_hash('legal_contract', to_jsonb(new)) then
+      raise exception 'Un contrat signé ne se modifie pas : établissez un avenant.' using errcode = '42501';
+    end if;
+  end if;
+  if new.status in ('signed', 'active') and (tg_op = 'INSERT' or old.status not in ('signed', 'active')) then
+    perform public.require_approval('legal_contract', new.id, to_jsonb(new),
+      'Ce contrat doit recevoir l''accord du CEO avant signature.');
+    new.signed_on := coalesce(new.signed_on, current_date);
+    new.effective_date := coalesce(new.effective_date, new.signed_on);
+  end if;
+  return new;
+end $$;
+
+create or replace function public.operation_cycles_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  perform public.approval_freeze('operation_cycle', new.id, to_jsonb(old), to_jsonb(new));
+  return new;
+end $$;
+drop trigger if exists operation_cycles_guard_bu on public.operation_cycles;
+create trigger operation_cycles_guard_bu before update on public.operation_cycles
+  for each row execute function public.operation_cycles_guard();
+
+create or replace function public.publish_operation_cycle(p_cycle uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare c public.operation_cycles; r record;
+begin
+  select * into c from public.operation_cycles where id = p_cycle for update;
+  if c.id is null then raise exception 'Cycle introuvable'; end if;
+  if not public.can_plan_project(c.project_id) then raise exception 'Permission refusée' using errcode = '42501'; end if;
+  if c.status = 'published' then return; end if;
+  if not exists (select 1 from public.operation_items where cycle_id = p_cycle) then
+    raise exception 'Ajoutez au moins une grande ligne avant de publier ce calendrier.';
+  end if;
+
+  if c.kind = 'monthly' then
+    if public.is_ceo() then
+      if not public.approval_valid('operation_cycle', p_cycle, to_jsonb(c)) then
+        perform public.record_ceo_decision('operation_cycle', p_cycle, to_jsonb(c));
+      end if;
+    elsif not public.approval_valid('operation_cycle', p_cycle, to_jsonb(c)) then
+      perform public.request_approval('operation_cycle', p_cycle, null, null, c.focus);
+      update public.operation_cycles set status = 'pending_ceo' where id = p_cycle;
+      return;
+    end if;
+  end if;
+
+  update public.operation_cycles set status = 'published', published_at = now() where id = p_cycle;
+  for r in
+    select distinct m.profile_id from public.project_members m where m.project_id = c.project_id
+    union select l.profile_id from public.project_liaisons l where l.project_id = c.project_id
+  loop
+    perform public.notify(r.profile_id, 'ops.cycle.published', 'Calendrier publié : ' || c.title,
+      c.focus, '/projets/' || c.project_id || '?cycle=' || c.id);
+  end loop;
+end $$;
+
+-- Effets d'une décision : publication, activation, retour en rédaction.
+create or replace function public.approval_requests_apply()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = old.status or old.status <> 'pending' or new.subject_id is null then return null; end if;
+  if new.status = 'approved' then
+    if new.kind = 'operation_cycle' then
+      update public.operation_cycles set status = 'published', published_at = now()
+       where id = new.subject_id and status <> 'published';
+    elsif new.kind = 'budget' then
+      update public.budgets set status = 'active' where id = new.subject_id and status = 'draft';
+    end if;
+  elsif new.status in ('rejected', 'cancelled') then
+    if new.kind = 'operation_cycle' then
+      update public.operation_cycles set status = 'draft' where id = new.subject_id and status = 'pending_ceo';
+    elsif new.kind = 'legal_contract' then
+      update public.legal_contracts set status = 'legal_review' where id = new.subject_id and status = 'pending_ceo';
+    elsif new.kind = 'employment_contract' then
+      update public.employment_contracts set status = 'draft' where id = new.subject_id and status = 'pending_ceo';
+    end if;
+  end if;
+  return null;
+end $$;
+
+-- Le registre des validations ne s'écrit que par les fonctions ci-dessus.
+revoke insert, update, delete on public.approval_requests from authenticated, anon;
+
+-- -----------------------------------------------------------------------------
+-- P0-05. Tâches : la vérification ne se lève pas par le titulaire
+-- -----------------------------------------------------------------------------
+create or replace function public.tasks_protect_review()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null or current_setting('veriion.task_flow', true) = 'on' then return new; end if;
+  if old.assignee_id = auth.uid()
+     and coalesce(old.reviewer_id, old.reporter_id) is distinct from auth.uid()
+     and not (old.project_id is not null and public.can_manage_project(old.project_id)) then
+    if new.requires_validation is distinct from old.requires_validation
+       or new.reviewer_id is distinct from old.reviewer_id
+       or new.reporter_id is distinct from old.reporter_id
+       or new.validated_by is distinct from old.validated_by
+       or new.validated_at is distinct from old.validated_at then
+      raise exception 'La vérification de cette tâche revient à la personne qui l''a confiée.' using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists tasks_protect_review_bu on public.tasks;
+create trigger tasks_protect_review_bu before update on public.tasks
+  for each row execute function public.tasks_protect_review();
+
+create or replace function public.submit_task(p_task uuid, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare t public.tasks; v_reviewer uuid; v_link text;
+begin
+  select * into t from public.tasks where id = p_task for update;
+  if t.id is null then raise exception 'Tâche introuvable'; end if;
+  if t.assignee_id is distinct from auth.uid() then
+    raise exception 'Seule la personne en charge peut soumettre cette tâche' using errcode = '42501';
+  end if;
+  if t.status = 'done' then raise exception 'Cette tâche est déjà terminée'; end if;
+  perform set_config('veriion.task_flow', 'on', true);
+
+  v_reviewer := coalesce(t.reviewer_id, t.reporter_id);
+  v_link := case when t.project_id is not null then '/projets/' || t.project_id || '?tache=' || t.id else '/taches' end;
+
+  if v_reviewer is null or v_reviewer = auth.uid() then
+    update public.tasks set status = 'done', submitted_at = now(), review_note = nullif(trim(coalesce(p_note, '')), '')
+     where id = p_task;
+  else
+    update public.tasks
+       set status = 'review', submitted_at = now(), requires_validation = true,
+           reviewer_id = v_reviewer, review_note = nullif(trim(coalesce(p_note, '')), '')
+     where id = p_task;
+    perform public.notify(v_reviewer, 'task.submitted', 'À vérifier : ' || t.title,
+      nullif(trim(coalesce(p_note, '')), ''), v_link);
+  end if;
+  perform set_config('veriion.task_flow', 'off', true);
+end $$;
+
+create or replace function public.review_task(p_task uuid, p_approve boolean, p_note text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare t public.tasks; v_link text;
+begin
+  select * into t from public.tasks where id = p_task for update;
+  if t.id is null then raise exception 'Tâche introuvable'; end if;
+  if not (coalesce(t.reviewer_id, t.reporter_id) = auth.uid()
+          or (t.project_id is not null and public.can_manage_project(t.project_id))
+          or public.is_ceo()) then
+    raise exception 'Cette vérification revient à la personne qui a confié la tâche' using errcode = '42501';
+  end if;
+  if t.assignee_id = auth.uid() and coalesce(t.reviewer_id, t.reporter_id) is distinct from auth.uid() and not public.is_ceo() then
+    raise exception 'Vous ne pouvez pas valider votre propre tâche' using errcode = '42501';
+  end if;
+  if not p_approve and length(trim(coalesce(p_note, ''))) < 3 then
+    raise exception 'Indiquez ce qui doit être repris';
+  end if;
+  perform set_config('veriion.task_flow', 'on', true);
+
+  v_link := case when t.project_id is not null then '/projets/' || t.project_id || '?tache=' || t.id else '/taches' end;
+
+  if p_approve then
+    update public.tasks
+       set status = 'done', validated_by = auth.uid(), validated_at = now(),
+           completed_at = coalesce(completed_at, now()), review_note = nullif(trim(coalesce(p_note, '')), '')
+     where id = p_task;
+    perform public.notify(t.assignee_id, 'task.validated', 'Tâche validée : ' || t.title, nullif(trim(coalesce(p_note, '')), ''), v_link);
+  else
+    update public.tasks
+       set status = 'in_progress', submitted_at = null, review_note = trim(p_note)
+     where id = p_task;
+    perform public.notify(t.assignee_id, 'task.rejected', 'À reprendre : ' || t.title, trim(p_note), v_link);
+  end if;
+  perform set_config('veriion.task_flow', 'off', true);
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- P0-07. Double authentification sur les opérations sensibles
+-- -----------------------------------------------------------------------------
+-- Politiques restrictives : elles s'ajoutent (ET logique) aux politiques existantes.
+do $$
+declare t text; c text;
+begin
+  foreach t in array array['budgets', 'invoices', 'invoice_lines', 'transactions', 'employment_contracts', 'legal_contracts', 'company_settings'] loop
+    foreach c in array array['insert', 'update', 'delete'] loop
+      execute format('drop policy if exists %I on public.%I', 'mfa: ' || c, t);
+      if c = 'insert' then
+        execute format('create policy %I on public.%I as restrictive for insert to authenticated with check (public.mfa_ok())', 'mfa: ' || c, t);
+      else
+        execute format('create policy %I on public.%I as restrictive for %s to authenticated using (public.mfa_ok())', 'mfa: ' || c, t, c);
+      end if;
+    end loop;
+  end loop;
+end $$;
+
+-- Salaires : chacun voit le sien ; les autres lectures exigent la double authentification.
+drop policy if exists "mfa: salaires" on public.salaries;
+create policy "mfa: salaires" on public.salaries as restrictive for all to authenticated
+  using (profile_id = auth.uid() or public.mfa_ok()) with check (public.mfa_ok());
+
+-- Documents confidentiels : double authentification exigée (sauf pour leur auteur).
+create or replace function public.document_access(p_doc uuid)
+returns int language plpgsql stable security definer set search_path = public as $$
+declare
+  d public.documents;
+  r int := 0;
+  direct int;
+begin
+  if p_doc is null or not public.is_active_user() then return 0; end if;
+  select * into d from public.documents where id = p_doc;
+  if d.id is null then return 0; end if;
+
+  if d.owner_id = auth.uid() then return 3; end if;
+  if d.classification = 'confidential' and not public.mfa_ok() then return 0; end if;
+  if d.folder_id is not null then r := public.folder_access(d.folder_id); end if;
+  if d.account_id is not null and public.can_read_crm() then r := greatest(r, 1); end if;
+
+  select max(public.share_rank(sh.role)) into direct
+  from public.shares sh
+  where sh.document_id = d.id
+    and (sh.expires_at is null or sh.expires_at > now())
+    and (sh.profile_id = auth.uid() or (sh.unit_id is not null and public.in_unit(sh.unit_id)));
+  direct := coalesce(direct, 0);
+
+  if d.classification = 'restricted' and r < 2 then r := 0; end if;
+  if d.classification = 'confidential' and r < 3 and not public.has_perm('docs.confidential') then r := 0; end if;
+  if d.classification = 'confidential' and public.has_perm('docs.confidential') then r := greatest(r, 1); end if;
+
+  return greatest(r, direct);
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- Rappel des décisions en attente : délai pris dans les paramètres de gouvernance.
+-- -----------------------------------------------------------------------------
+create or replace function public.generate_extra_reminders()
+returns int language plpgsql security definer set search_path = public as $$
+declare today date := (now() at time zone 'Africa/Porto-Novo')::date; n int := 0; r record;
+  v_days int := coalesce((select approval_reminder_days from public.governance_settings where id), 2);
+begin
+  for r in
+    select c.id, c.reference, c.title, c.end_date, c.owner_id
+    from public.legal_contracts c
+    where c.status in ('signed', 'active') and c.end_date is not null
+      and c.end_date - c.renewal_notice_days <= today and c.end_date >= today
+  loop
+    perform public.notify(r.owner_id, 'reminder.contract',
+      'Échéance contrat : ' || r.reference,
+      r.title || ' arrive à terme le ' || to_char(r.end_date, 'DD/MM/YYYY') || '.', '/juridique?contrat=' || r.id);
+    n := n + 1;
+  end loop;
+
+  for r in
+    select p.id from public.profiles p where p.status = 'active' and p.system_role = 'ceo'
+      and exists (select 1 from public.approval_requests a where a.status = 'pending' and a.created_at < now() - make_interval(days => v_days))
+  loop
+    perform public.notify(r.id, 'reminder.approvals', 'Des décisions attendent votre accord', null, '/validations');
+    n := n + 1;
+  end loop;
+
+  for r in
+    select c.id, c.title, c.project_id, p.lead_id
+    from public.operation_cycles c join public.projects p on p.id = c.project_id
+    where c.status = 'published' and c.period_end < today and p.lead_id is not null
+      and not exists (select 1 from public.operation_reports o where o.cycle_id = c.id)
+  loop
+    perform public.notify(r.lead_id, 'reminder.report', 'Rapport attendu : ' || r.title,
+      'Le cycle est terminé : rendez compte aux Opérations.', '/projets/' || r.project_id || '?cycle=' || r.id);
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+revoke execute on function public.generate_extra_reminders() from public, anon, authenticated;
+
+-- Les modèles de droits ont changé : recalcul pour tous.
+do $$ declare r record; begin
+  for r in select id from public.profiles where status = 'active' loop
+    perform public.sync_auto_grants(r.id);
+  end loop;
+end $$;
+
+-- >>>>>>>>>> supabase/migrations/20261012000012_p0_durcissement.sql
+-- =============================================================================
+-- VERIION OS — Migration 12 : durcissement des privilèges (phase 0, lot P0-09)
+-- =============================================================================
+-- Sur Supabase, tout objet créé dans « public » est accordé par défaut aux rôles
+-- de l'API (anon, authenticated). Les migrations 5 à 11 s'appuyaient sur ces
+-- privilèges implicites : la table access_codes, censée n'être accessible par
+-- aucun grant, l'était donc en lecture (la RLS sans politique la protégeait
+-- seule). On retire ici explicitement tout accès anonyme et les grants non voulus.
+-- =============================================================================
+
+-- 1. Le rôle anonyme n'a accès à rien dans le schéma public.
+revoke all on all tables    in schema public from anon;
+revoke all on all sequences in schema public from anon;
+
+-- Fonctions : retire l'exécution à PUBLIC et à anon, en conservant pour
+-- « authenticated » exactement ce qu'il pouvait déjà exécuter.
+do $$
+declare f record; keep boolean;
+begin
+  for f in
+    select p.oid, p.oid::regprocedure as sig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.prokind = 'f'
+      and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')
+  loop
+    keep := has_function_privilege('authenticated', f.oid, 'execute');
+    execute format('revoke execute on function %s from public, anon', f.sig);
+    if keep then execute format('grant execute on function %s to authenticated', f.sig); end if;
+  end loop;
+end $$;
+
+-- Et pour les objets créés par les prochaines migrations.
+alter default privileges in schema public revoke all on tables    from anon;
+alter default privileges in schema public revoke all on sequences from anon;
+alter default privileges in schema public revoke execute on functions from public, anon;
+
+-- 2. Tables qui ne doivent être lues que par leurs fonctions security definer.
+revoke all on public.access_codes from authenticated;
+
+-- 3. Inscriptions : seul le domaine de l'entreprise est accepté, invitation ou non.
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  meta jsonb := coalesce(new.raw_user_meta_data, '{}'::jsonb);
+  has_ceo boolean;
+  v_domain text := coalesce((select email_domain from public.company_settings where id), 'veriion.com');
+begin
+  if lower(split_part(coalesce(new.email, ''), '@', 2)) <> lower(v_domain) then
+    raise exception 'Seules les adresses @% peuvent ouvrir un compte VERIION OS', v_domain using errcode = '42501';
+  end if;
+  select exists(select 1 from public.profiles where system_role = 'ceo') into has_ceo;
+  insert into public.profiles (id, email, first_name, last_name, job_title, primary_unit_id, system_role, hire_date)
+  values (
+    new.id,
+    lower(new.email),
+    coalesce(nullif(meta->>'first_name', ''), initcap(split_part(split_part(new.email, '@', 1), '.', 1))),
+    coalesce(nullif(meta->>'last_name', ''),  initcap(split_part(split_part(new.email, '@', 1), '.', 2))),
+    meta->>'job_title',
+    nullif(meta->>'primary_unit_id', '')::uuid,
+    case when has_ceo then 'employee'::public.system_role else 'ceo'::public.system_role end,
+    current_date
+  )
+  on conflict (id) do nothing;
+  return new;
+end $$;
+
+-- >>>>>>>>>> supabase/migrations/20261012000013_p0_integrite_financiere.sql
+-- =============================================================================
+-- VERIION OS — Migration 13 : intégrité financière minimale (phase 0, lot P0-08)
+-- =============================================================================
+--   * une facture émise ne se modifie plus (montants, lignes, client) ;
+--   * aucune facture ni opération ne se supprime : on annule par contre-passation ;
+--   * annuler un encaissement passe une écriture inverse au lieu d'effacer le revenu ;
+--   * numérotation des factures continue, par exercice ;
+--   * la fusion d'unités ne réécrit plus l'historique financier.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Opérations : immuables, annulées par contre-passation
+-- -----------------------------------------------------------------------------
+alter table public.transactions
+  add column if not exists reverses_id uuid references public.transactions(id) on delete restrict,
+  add column if not exists reversed_by uuid references public.transactions(id) on delete set null,
+  add column if not exists reversal_reason text;
+
+alter table public.transactions drop constraint if exists transactions_amount_check;
+alter table public.transactions drop constraint if exists transactions_amount_sign;
+alter table public.transactions add constraint transactions_amount_sign
+  check ((reverses_id is null and amount > 0) or (reverses_id is not null and amount < 0));
+create unique index if not exists transactions_one_reversal on public.transactions(reverses_id) where reverses_id is not null;
+
+-- Une facture ne porte qu'un revenu actif (non contre-passé).
+alter table public.transactions drop constraint if exists transactions_invoice_id_key;
+drop index if exists public.transactions_invoice_id_key;
+create unique index if not exists transactions_invoice_active
+  on public.transactions(invoice_id) where invoice_id is not null and reverses_id is null and reversed_by is null;
+
+
+/** Contre-passe une opération : écriture inverse datée du jour, motivée. */
+create or replace function public.reverse_transaction(p_id uuid, p_reason text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare t public.transactions; v_id uuid;
+begin
+  if not public.has_perm('finance.admin') then raise exception 'Permission refusée' using errcode = '42501'; end if;
+  perform public.require_mfa();
+  if length(trim(coalesce(p_reason, ''))) < 3 then raise exception 'Indiquez le motif de l''annulation'; end if;
+  select * into t from public.transactions where id = p_id for update;
+  if t.id is null then raise exception 'Opération introuvable'; end if;
+  if t.reverses_id is not null then raise exception 'Une contre-passation ne se contre-passe pas'; end if;
+  if t.reversed_by is not null then raise exception 'Cette opération a déjà été annulée'; end if;
+  if t.invoice_id is not null and auth.uid() is not null and current_setting('veriion.invoice_flow', true) is distinct from 'on' then
+    raise exception 'Ce revenu provient d''une facture : annulez l''encaissement depuis la facture.';
+  end if;
+
+  insert into public.transactions (type, amount, currency, occurred_on, category, description, unit_id, project_id,
+                                   account_id, product, country, reference, reverses_id, reversal_reason, created_by)
+  values (t.type, -t.amount, t.currency, current_date, t.category, 'Annulation — ' || coalesce(t.description, t.category),
+          t.unit_id, t.project_id, t.account_id, t.product, t.country, t.reference, t.id, trim(p_reason), auth.uid())
+  returning id into v_id;
+
+  -- Seule mise à jour système permise sur la ligne d'origine.
+  perform set_config('veriion.txn_system', 'on', true);
+  update public.transactions set reversed_by = v_id, reversal_reason = trim(p_reason) where id = t.id;
+  perform set_config('veriion.txn_system', 'off', true);
+
+  -- Un accord de dépense retrouve le montant libéré.
+  if t.approval_id is not null and t.type = 'expense' then
+    update public.approval_requests set consumed_amount = greatest(0, consumed_amount - t.amount) where id = t.approval_id;
+  end if;
+  return v_id;
+end $$;
+revoke execute on function public.reverse_transaction(uuid, text) from public, anon;
+grant execute on function public.reverse_transaction(uuid, text) to authenticated;
+
+-- Le drapeau système autorise uniquement le marquage « contre-passée ».
+create or replace function public.transactions_immutable()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'DELETE' then
+    if auth.uid() is not null then
+      raise exception 'Une opération enregistrée ne se supprime pas : contre-passez-la.' using errcode = '42501';
+    end if;
+    return old;
+  end if;
+  if current_setting('veriion.txn_system', true) = 'on'
+     and new.reversed_by is distinct from old.reversed_by
+     and (to_jsonb(new) - 'reversed_by' - 'reversal_reason') = (to_jsonb(old) - 'reversed_by' - 'reversal_reason') then
+    return new;
+  end if;
+  if auth.uid() is not null and (
+       new.type is distinct from old.type or new.amount is distinct from old.amount
+    or new.currency is distinct from old.currency or new.occurred_on is distinct from old.occurred_on
+    or new.unit_id is distinct from old.unit_id or new.project_id is distinct from old.project_id
+    or new.account_id is distinct from old.account_id or new.invoice_id is distinct from old.invoice_id
+    or new.approval_id is distinct from old.approval_id or new.reverses_id is distinct from old.reverses_id
+    or new.reversed_by is distinct from old.reversed_by) then
+    raise exception 'Le montant, la date et les rattachements d''une opération ne se modifient pas : contre-passez-la puis ressaisissez-la.' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists transactions_immutable_bud on public.transactions;
+create trigger transactions_immutable_bud before update or delete on public.transactions
+  for each row execute function public.transactions_immutable();
+
+drop policy if exists "transactions: gestion" on public.transactions;
+drop policy if exists "transactions: saisie" on public.transactions;
+drop policy if exists "transactions: correction" on public.transactions;
+create policy "transactions: saisie" on public.transactions for insert to authenticated
+  with check (public.has_perm('finance.admin') and reverses_id is null);
+create policy "transactions: correction" on public.transactions for update to authenticated
+  using (public.has_perm('finance.admin')) with check (public.has_perm('finance.admin'));
+-- Aucune politique de suppression : la contre-passation est la seule voie.
+
+-- -----------------------------------------------------------------------------
+-- 2. Factures : numérotation continue, verrouillage après émission
+-- -----------------------------------------------------------------------------
+alter table public.invoices add column if not exists sent_at timestamptz;
+update public.invoices set sent_at = coalesce(sent_at, updated_at) where status in ('sent', 'paid', 'overdue');
+
+create table if not exists public.invoice_counters (
+  scope text not null,          -- série (préfixe), par exemple « FAC »
+  year  int  not null,
+  last  int  not null default 0,
+  primary key (scope, year)
+);
+alter table public.invoice_counters enable row level security;
+revoke all on public.invoice_counters from anon, authenticated;
+
+-- Reprend les numéros existants pour que la série continue sans collision.
+insert into public.invoice_counters (scope, year, last)
+select 'FAC', split_part(number, '-', 2)::int, max(split_part(number, '-', 3)::int)
+  from public.invoices where number ~ '^FAC-[0-9]{4}-[0-9]+$'
+ group by split_part(number, '-', 2)
+on conflict (scope, year) do update set last = greatest(public.invoice_counters.last, excluded.last);
+
+create or replace function public.next_invoice_number(p_scope text, p_date date)
+returns text language plpgsql security definer set search_path = public as $$
+declare v_year int := extract(year from coalesce(p_date, current_date))::int; v_n int;
+begin
+  insert into public.invoice_counters (scope, year, last) values (p_scope, v_year, 1)
+  on conflict (scope, year) do update set last = public.invoice_counters.last + 1
+  returning last into v_n;
+  return p_scope || '-' || v_year || '-' || lpad(v_n::text, 5, '0');
+end $$;
+revoke execute on function public.next_invoice_number(text, date) from public, anon, authenticated;
+
+alter table public.invoices alter column number drop default;
+
+create or replace function public.invoices_before_insert()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.number is null or auth.uid() is not null then
+    new.number := public.next_invoice_number('FAC', new.issue_date);
+  end if;
+  new.status := 'draft';
+  new.sent_at := null; new.paid_at := null;
+  return new;
+end $$;
+drop trigger if exists invoices_bi on public.invoices;
+create trigger invoices_bi before insert on public.invoices
+  for each row execute function public.invoices_before_insert();
+
+create or replace function public.invoices_before_update()
+returns trigger language plpgsql as $$
+declare allowed boolean;
+begin
+  -- Transitions de statut permises.
+  if new.status is distinct from old.status then
+    allowed := case old.status
+      when 'draft'     then new.status in ('sent', 'cancelled')
+      when 'sent'      then new.status in ('paid', 'overdue', 'cancelled')
+      when 'overdue'   then new.status in ('paid', 'sent', 'cancelled')
+      when 'paid'      then new.status in ('sent')
+      when 'cancelled' then new.status = 'draft' and old.sent_at is null
+      else false end;
+    if not allowed then
+      raise exception 'Passage de « % » à « % » impossible pour une facture.', old.status, new.status using errcode = '23514';
+    end if;
+  end if;
+
+  -- Une facture émise est figée : seuls le statut, l'échéance et les notes évoluent.
+  if old.status <> 'draft' and current_setting('veriion.invoice_recompute', true) is distinct from 'on' and (
+       new.number is distinct from old.number or new.account_id is distinct from old.account_id
+    or new.issue_date is distinct from old.issue_date or new.currency is distinct from old.currency
+    or new.subtotal is distinct from old.subtotal or new.tax_rate is distinct from old.tax_rate
+    or new.tax_amount is distinct from old.tax_amount or new.total is distinct from old.total
+    or new.unit_id is distinct from old.unit_id or new.product is distinct from old.product
+    or new.country is distinct from old.country or new.opportunity_id is distinct from old.opportunity_id) then
+    raise exception 'Une facture émise ne se modifie plus : annulez-la et établissez-en une nouvelle.' using errcode = '42501';
+  end if;
+  if old.status = 'draft' and new.number is distinct from old.number then
+    raise exception 'Le numéro de facture est attribué par le système.' using errcode = '42501';
+  end if;
+
+  if new.tax_rate is distinct from old.tax_rate then
+    new.tax_amount := round(new.subtotal * new.tax_rate / 100, 2);
+    new.total      := new.subtotal + new.tax_amount;
+  end if;
+  if new.status = 'sent' and old.status = 'draft' then new.sent_at := now(); end if;
+  if new.status = 'paid' and old.status <> 'paid' then
+    new.paid_at := coalesce(new.paid_at, now());
+  elsif new.status <> 'paid' then
+    new.paid_at := null;
+  end if;
+  return new;
+end $$;
+
+-- Encaissement : revenu ; annulation de l'encaissement : contre-passation.
+create or replace function public.invoices_after_update()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_txn uuid;
+begin
+  if new.status = 'paid' and old.status <> 'paid' and new.total > 0 then
+    insert into public.transactions (type, amount, currency, occurred_on, category, description,
+                                     unit_id, account_id, invoice_id, product, country, reference, created_by)
+    values ('revenue', new.total, new.currency, coalesce(new.paid_at, now())::date, 'Ventes',
+            'Paiement facture ' || new.number, new.unit_id, new.account_id, new.id, new.product, new.country,
+            new.number, auth.uid());
+  elsif old.status = 'paid' and new.status <> 'paid' then
+    select id into v_txn from public.transactions
+     where invoice_id = new.id and reverses_id is null and reversed_by is null;
+    if v_txn is not null then
+      perform set_config('veriion.invoice_flow', 'on', true);
+      perform public.reverse_transaction(v_txn, 'Encaissement de la facture ' || new.number || ' annulé');
+      perform set_config('veriion.invoice_flow', 'off', true);
+    end if;
+  end if;
+  return null;
+end $$;
+
+-- Les lignes ne changent qu'en brouillon ; le recalcul des totaux reste permis.
+create or replace function public.invoice_lines_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_status public.invoice_status;
+begin
+  select status into v_status from public.invoices where id = coalesce(new.invoice_id, old.invoice_id);
+  if auth.uid() is not null and v_status is distinct from 'draft' then
+    raise exception 'Les lignes d''une facture émise ne se modifient plus.' using errcode = '42501';
+  end if;
+  return coalesce(new, old);
+end $$;
+drop trigger if exists invoice_lines_guard_biud on public.invoice_lines;
+create trigger invoice_lines_guard_biud before insert or update or delete on public.invoice_lines
+  for each row execute function public.invoice_lines_guard();
+
+create or replace function public.recompute_invoice(p_invoice uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform set_config('veriion.invoice_recompute', 'on', true);
+  update public.invoices i set
+    subtotal   = coalesce(s.sum, 0),
+    tax_amount = round(coalesce(s.sum, 0) * i.tax_rate / 100, 2),
+    total      = coalesce(s.sum, 0) + round(coalesce(s.sum, 0) * i.tax_rate / 100, 2)
+  from (select sum(amount) as sum from public.invoice_lines where invoice_id = p_invoice) s
+  where i.id = p_invoice;
+  perform set_config('veriion.invoice_recompute', 'off', true);
+end $$;
+revoke execute on function public.recompute_invoice(uuid) from public, anon, authenticated;
+
+-- Pas de suppression de facture : on l'annule.
+drop policy if exists "factures: gestion" on public.invoices;
+drop policy if exists "factures: création" on public.invoices;
+drop policy if exists "factures: modification" on public.invoices;
+create policy "factures: création" on public.invoices for insert to authenticated
+  with check (public.has_perm('finance.admin'));
+create policy "factures: modification" on public.invoices for update to authenticated
+  using (public.has_perm('finance.admin')) with check (public.has_perm('finance.admin'));
+
+-- -----------------------------------------------------------------------------
+-- 3. Fusion d'unités : l'historique financier garde son unité d'origine
+-- -----------------------------------------------------------------------------
+alter table public.org_units add column if not exists merged_into uuid references public.org_units(id) on delete set null;
+
+create or replace function public.merge_org_units(p_source uuid, p_target uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  s public.org_units;
+  t public.org_units;
+  m record;
+  v_role public.membership_role;
+  v_src_root uuid;
+  v_tgt_root uuid;
+begin
+  if not public.has_perm('org.manage') then
+    raise exception 'Seule la direction peut fusionner des unités' using errcode = '42501';
+  end if;
+  perform public.require_mfa();
+  if p_source = p_target then raise exception 'Choisissez deux unités différentes'; end if;
+  select * into s from public.org_units where id = p_source;
+  select * into t from public.org_units where id = p_target;
+  if s.id is null or t.id is null then raise exception 'Unité introuvable'; end if;
+  if s.parent_id is null then raise exception 'L''entreprise elle-même ne peut pas être fusionnée'; end if;
+  if s.id = any(t.path) then raise exception 'L''unité d''accueil dépend de l''unité à fusionner : choisissez l''autre sens'; end if;
+
+  for m in select * from public.unit_memberships where unit_id = p_source and end_date is null loop
+    v_role := m.role;
+    if v_role = 'head' and exists (
+      select 1 from public.unit_memberships where unit_id = p_target and role = 'head' and end_date is null
+    ) then
+      v_role := 'deputy';
+    end if;
+    if exists (select 1 from public.unit_memberships where unit_id = p_target and profile_id = m.profile_id and end_date is null) then
+      update public.unit_memberships set end_date = current_date where id = m.id;
+    else
+      update public.unit_memberships
+         set unit_id = p_target, role = v_role, title = public.job_title_for(p_target, v_role)
+       where id = m.id;
+    end if;
+  end loop;
+
+  update public.org_units    set parent_id = p_target where parent_id = p_source;
+  update public.channels     set unit_id   = p_target where unit_id = p_source;
+  update public.projects     set unit_id   = p_target where unit_id = p_source;
+  update public.announcements set unit_id  = p_target where unit_id = p_source;
+  update public.objectives   set unit_id   = p_target where unit_id = p_source;
+  -- Factures et opérations passées restent rattachées à l'unité d'origine
+  -- (merged_into permet de les consolider avec l'unité d'accueil).
+  update public.project_liaisons l set unit_id = p_target where unit_id = p_source
+     and not exists (select 1 from public.project_liaisons x where x.project_id = l.project_id and x.unit_id = p_target);
+  delete from public.project_liaisons where unit_id = p_source;
+
+  update public.budgets b set amount = b.amount + s2.amount
+    from public.budgets s2
+   where b.unit_id = p_target and s2.unit_id = p_source and s2.fiscal_year = b.fiscal_year;
+  update public.budgets set unit_id = p_target
+   where unit_id = p_source and fiscal_year not in (select fiscal_year from public.budgets where unit_id = p_target);
+  delete from public.budgets where unit_id = p_source;
+
+  select id into v_src_root from public.folders where is_root and space = 'unit' and unit_id = p_source;
+  select id into v_tgt_root from public.folders where is_root and space = 'unit' and unit_id = p_target;
+  if v_src_root is not null and v_tgt_root is not null then
+    for m in select * from public.folders where parent_id = v_src_root and deleted_at is null loop
+      if exists (select 1 from public.folders f
+                  where f.parent_id = v_tgt_root and lower(f.name) = lower(m.name) and f.deleted_at is null) then
+        update public.folders set parent_id = v_tgt_root, name = m.name || ' (' || s.name || ')' where id = m.id;
+      else
+        update public.folders set parent_id = v_tgt_root where id = m.id;
+      end if;
+    end loop;
+    update public.documents set folder_id = v_tgt_root where folder_id = v_src_root;
+    update public.folders set unit_id = p_target where unit_id = p_source and not is_root;
+    update public.folders set deleted_at = now() where id = v_src_root;
+  end if;
+
+  update public.profiles set primary_unit_id = p_target where primary_unit_id = p_source;
+  update public.org_units set archived_at = now(), merged_into = p_target where id = p_source;
+end $$;
+
+-- >>>>>>>>>> supabase/migrations/20261012000014_p0_circuits.sql
+-- =============================================================================
+-- VERIION OS — Migration 14 : circuits branchés de bout en bout (phase 0, lot P0-06)
+-- =============================================================================
+--   * budget : brouillon → activation directe sous le seuil, accord du CEO au-delà ;
+--   * contrat de travail : brouillon → accord du CEO → signature (le salaire suit) ;
+--   * contrat juridique : machine à états stricte, revue juridique obligatoire,
+--     expiration et renouvellement tacite automatiques.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- 1. Budgets
+-- -----------------------------------------------------------------------------
+/** Active un budget : directement sous le seuil, sinon demande l'accord du CEO. Renvoie l'état obtenu. */
+create or replace function public.activate_budget(p_budget uuid, p_justification text default null)
+returns text language plpgsql security definer set search_path = public as $$
+declare b public.budgets;
+begin
+  select * into b from public.budgets where id = p_budget for update;
+  if b.id is null then raise exception 'Budget introuvable'; end if;
+  if not public.has_perm('finance.admin') then raise exception 'Seule la finance active un budget' using errcode = '42501'; end if;
+  perform public.require_mfa();
+  if b.status = 'active' then return 'active'; end if;
+  if b.amount <= public.ceo_approval_threshold() or public.is_ceo()
+     or public.approval_valid('budget', b.id, to_jsonb(b)) then
+    update public.budgets set status = 'active' where id = p_budget;
+    return 'active';
+  end if;
+  perform public.request_approval('budget', p_budget, null, null, p_justification);
+  return 'pending';
+end $$;
+revoke execute on function public.activate_budget(uuid, text) from public, anon;
+grant execute on function public.activate_budget(uuid, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 2. Contrats de travail
+-- -----------------------------------------------------------------------------
+create or replace function public.submit_employment_contract(p_contract uuid, p_justification text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare c public.employment_contracts; v_id uuid;
+begin
+  select * into c from public.employment_contracts where id = p_contract;
+  if c.id is null then raise exception 'Contrat introuvable'; end if;
+  if not public.has_perm('hr.admin') then raise exception 'Permission refusée' using errcode = '42501'; end if;
+  if c.status <> 'draft' then raise exception 'Seul un contrat en brouillon se soumet'; end if;
+  v_id := public.request_approval('employment_contract', p_contract, null, null, p_justification);
+  if public.approval_valid('employment_contract', p_contract, to_jsonb(c)) then
+    return v_id;  -- décision directe du CEO : reste à signer
+  end if;
+  update public.employment_contracts set status = 'pending_ceo' where id = p_contract;
+  return v_id;
+end $$;
+revoke execute on function public.submit_employment_contract(uuid, text) from public, anon;
+grant execute on function public.submit_employment_contract(uuid, text) to authenticated;
+
+create or replace function public.employment_contracts_transition()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare allowed boolean;
+begin
+  if tg_op = 'INSERT' then
+    if auth.uid() is not null and new.status not in ('draft') then
+      raise exception 'Un contrat de travail commence en brouillon.' using errcode = '23514';
+    end if;
+    return new;
+  end if;
+  if new.status is distinct from old.status and auth.uid() is not null then
+    allowed := case old.status
+      when 'draft'       then new.status in ('pending_ceo', 'signed')
+      when 'pending_ceo' then new.status in ('draft', 'signed')
+      when 'signed'      then new.status = 'ended'
+      else false end;
+    if not allowed then
+      raise exception 'Passage de « % » à « % » impossible pour un contrat de travail.', old.status, new.status using errcode = '23514';
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists employment_contracts_aa_transition_biu on public.employment_contracts;
+create trigger employment_contracts_aa_transition_biu before insert or update on public.employment_contracts
+  for each row execute function public.employment_contracts_transition();
+
+-- -----------------------------------------------------------------------------
+-- 3. Contrats juridiques : machine à états
+-- -----------------------------------------------------------------------------
+create or replace function public.legal_contracts_transition()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare allowed boolean;
+begin
+  if tg_op = 'INSERT' then
+    if auth.uid() is not null and new.status <> 'draft' then
+      raise exception 'Un contrat commence en brouillon.' using errcode = '23514';
+    end if;
+    return new;
+  end if;
+  if new.status is distinct from old.status and auth.uid() is not null then
+    allowed := case old.status
+      when 'draft'        then new.status in ('legal_review', 'terminated')
+      when 'legal_review' then new.status in ('draft', 'pending_ceo', 'terminated')
+      when 'pending_ceo'  then new.status in ('legal_review', 'signed', 'active')
+      when 'signed'       then new.status in ('active', 'terminated')
+      when 'active'       then new.status in ('terminated', 'expired')
+      else false end;
+    if not allowed then
+      raise exception 'Passage de « % » à « % » impossible : le circuit est rédaction → revue juridique → accord du CEO → signature.',
+        old.status, new.status using errcode = '23514';
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists legal_contracts_aa_transition_biu on public.legal_contracts;
+create trigger legal_contracts_aa_transition_biu before insert or update on public.legal_contracts
+  for each row execute function public.legal_contracts_transition();
+
+/** La revue juridique est obligatoire avant la signature du CEO. */
+create or replace function public.submit_contract_for_signature(p_contract uuid, p_justification text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare c public.legal_contracts; v_id uuid;
+begin
+  select * into c from public.legal_contracts where id = p_contract;
+  if c.id is null then raise exception 'Contrat introuvable'; end if;
+  if not (public.has_perm('legal.admin') or public.is_ceo()) then
+    raise exception 'La soumission à signature revient au Juridique' using errcode = '42501';
+  end if;
+  if c.status <> 'legal_review' then
+    raise exception 'Le contrat doit d''abord passer en revue juridique.';
+  end if;
+  v_id := public.request_approval('legal_contract', p_contract, null, null, p_justification);
+  update public.legal_contracts set status = 'pending_ceo' where id = p_contract;
+  return v_id;
+end $$;
+
+/**
+ * Tâche quotidienne : contrats arrivés à terme. Renouvellement tacite pour une
+ * durée égale à la précédente, sinon expiration. Le propriétaire est prévenu.
+ */
+create or replace function public.process_contract_terms()
+returns int language plpgsql security definer set search_path = public as $$
+declare today date := (now() at time zone 'Africa/Porto-Novo')::date; n int := 0; r record; v_len int;
+begin
+  for r in
+    select * from public.legal_contracts
+     where status in ('signed', 'active') and end_date is not null and end_date < today
+  loop
+    if r.auto_renew then
+      v_len := greatest(30, r.end_date - coalesce(r.effective_date, r.signed_on, r.end_date - 365));
+      update public.legal_contracts
+         set end_date = r.end_date + v_len, status = 'active',
+             notes = trim(coalesce(notes, '') || E'\n' || 'Renouvelé tacitement le ' || to_char(today, 'DD/MM/YYYY')
+                     || ' jusqu''au ' || to_char(r.end_date + v_len, 'DD/MM/YYYY') || '.')
+       where id = r.id;
+      perform public.notify(r.owner_id, 'legal.renewed', 'Contrat renouvelé : ' || r.reference,
+        r.title || ' court jusqu''au ' || to_char(r.end_date + v_len, 'DD/MM/YYYY') || '.', '/juridique?contrat=' || r.id);
+    else
+      update public.legal_contracts set status = (case when status = 'signed' then 'terminated' else 'expired' end)::public.legal_contract_status
+       where id = r.id;
+      perform public.notify(r.owner_id, 'legal.expired', 'Contrat échu : ' || r.reference,
+        r.title || ' est arrivé à terme le ' || to_char(r.end_date, 'DD/MM/YYYY') || '.', '/juridique?contrat=' || r.id);
+    end if;
+    n := n + 1;
+  end loop;
+  -- Contrats signés dont la date d'effet est atteinte : actifs.
+  update public.legal_contracts set status = 'active'
+   where status = 'signed' and coalesce(effective_date, signed_on) <= today;
+  return n;
+end $$;
+revoke execute on function public.process_contract_terms() from public, anon, authenticated;
+
+do $$
+begin
+  perform cron.schedule('veriion-contract-terms', '15 5 * * *', 'select public.process_contract_terms()');
+exception when others then
+  raise notice 'pg_cron non disponible : échéances des contrats à planifier plus tard (%)', sqlerrm;
+end $$;
+
+-- >>>>>>>>>> supabase/migrations/20261012000015_p0_vues_interface.sql
+-- =============================================================================
+-- VERIION OS — Migration 15 : vues d'appui à l'interface (phase 0)
+-- =============================================================================
+
+-- État d'un accord : caduc si le contenu couvert a changé depuis la décision.
+create or replace function public.approval_is_stale(p_id uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select a.subject_id is not null and a.subject_hash is not null and a.status in ('approved', 'pending')
+     and public.approval_hash(a.kind, public.approval_subject_row(a.kind, a.subject_id)) is distinct from a.subject_hash
+  from public.approval_requests a where a.id = p_id
+$$;
+revoke execute on function public.approval_is_stale(uuid) from public, anon;
+grant execute on function public.approval_is_stale(uuid) to authenticated;
+
+-- Vue avec les droits de l'appelant (security_invoker) : mêmes lignes que la table.
+create or replace view public.approval_requests_status with (security_invoker = true) as
+  select a.*, public.approval_is_stale(a.id) as stale
+  from public.approval_requests a;
+revoke all on public.approval_requests_status from anon;
+grant select on public.approval_requests_status to authenticated;
+
+/** Accords de dépense encore disponibles pour l'appelant (avec leur reste). */
+create or replace function public.available_expense_approvals()
+returns table (id uuid, subject_label text, amount numeric, consumed_amount numeric, remaining numeric,
+               currency text, decided_at timestamptz, unit_id uuid, project_id uuid)
+language sql stable security definer set search_path = public as $$
+  select a.id, a.subject_label, a.amount, a.consumed_amount, a.amount - a.consumed_amount, a.currency, a.decided_at,
+         a.unit_id, a.project_id
+  from public.approval_requests a
+  where a.kind = 'expense' and a.status = 'approved' and coalesce(a.amount, 0) > a.consumed_amount
+    and public.has_perm('finance.admin')
+  order by a.decided_at desc
+$$;
+revoke execute on function public.available_expense_approvals() from public, anon;
+grant execute on function public.available_expense_approvals() to authenticated;
+
+-- File d'envoi push, éventuellement limitée à une personne (notification de test).
+drop function if exists public.claim_push_batch(int);
+create or replace function public.claim_push_batch(p_limit int default 200, p_profile uuid default null)
+returns table (id uuid, profile_id uuid, kind text, category text, title text, body text, link text, created_at timestamptz)
+language plpgsql security definer set search_path = public as $$
+begin
+  return query
+  with c as (
+    select n.id from public.notifications n
+    where n.pushed_at is null and n.read_at is null and n.created_at > now() - interval '30 minutes'
+      and (p_profile is null or n.profile_id = p_profile)
+    order by n.created_at
+    limit p_limit
+    for update skip locked
+  )
+  update public.notifications n set pushed_at = now()
+  from c where n.id = c.id
+  returning n.id, n.profile_id, n.kind, public.notification_category(n.kind), n.title, n.body, n.link, n.created_at;
+end $$;
+revoke execute on function public.claim_push_batch(int, uuid) from public, anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Supervision (P0-10) : état de santé lu par /api/health (clé service_role).
+-- -----------------------------------------------------------------------------
+create or replace function public.ops_health()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_cron jsonb := '[]'::jsonb;
+begin
+  begin
+    execute $q$
+      select coalesce(jsonb_agg(jsonb_build_object('job', j.jobname, 'at', d.start_time, 'message', left(d.return_message, 200))), '[]'::jsonb)
+      from cron.job_run_details d join cron.job j on j.jobid = d.jobid
+      where d.status = 'failed' and d.start_time > now() - interval '24 hours'
+    $q$ into v_cron;
+  exception when others then
+    v_cron := '[]'::jsonb;
+  end;
+  return jsonb_build_object(
+    'database', 'ok',
+    'push_backlog', (select count(*) from public.notifications where pushed_at is null and read_at is null
+                       and created_at between now() - interval '30 minutes' and now() - interval '5 minutes'),
+    'email_backlog', (select count(*) from public.notifications where emailed_at is null and read_at is null
+                       and created_at between now() - interval '3 days' and now() - interval '15 minutes'),
+    'pending_approvals', (select count(*) from public.approval_requests where status = 'pending'),
+    'cron_failures_24h', v_cron
+  );
+end $$;
+revoke execute on function public.ops_health() from public, anon, authenticated;
 
 -- >>>>>>>>>> supabase/seed.sql
 -- =============================================================================

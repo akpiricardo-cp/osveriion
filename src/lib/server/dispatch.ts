@@ -31,7 +31,7 @@ function groupBy<T, K extends string>(list: T[], key: (x: T) => K) {
  *  - résumé quotidien : pour les personnes qui l'ont choisi, à l'heure qu'elles ont fixée.
  * Les files sont réservées en base (FOR UPDATE SKIP LOCKED) : plusieurs appels simultanés n'envoient rien en double.
  */
-export async function dispatchNotifications(): Promise<DispatchStats> {
+export async function dispatchNotifications(options: { onlyProfile?: string; pushOnly?: boolean } = {}): Promise<DispatchStats> {
   const admin = createAdminClient();
   const stats: DispatchStats = { push: 0, pushSkipped: 0, gone: 0, emails: 0, emailItems: 0, errors: [] };
 
@@ -45,7 +45,7 @@ export async function dispatchNotifications(): Promise<DispatchStats> {
 
   // ── Push ────────────────────────────────────────────────────────────────
   if (pushConfigured()) {
-    const { data, error } = await admin.rpc("claim_push_batch", { p_limit: 300 });
+    const { data, error } = await admin.rpc("claim_push_batch", { p_limit: 300, p_profile: options.onlyProfile ?? null });
     if (error) stats.errors.push(`push: ${error.message}`);
     const rows = (data as Row[]) ?? [];
     if (rows.length) {
@@ -81,7 +81,7 @@ export async function dispatchNotifications(): Promise<DispatchStats> {
   }
 
   // ── E-mails ─────────────────────────────────────────────────────────────
-  if (mailerConfigured()) {
+  if (mailerConfigured() && !options.pushOnly) {
     const [instant, digest] = await Promise.all([admin.rpc("claim_email_batch", { p_limit: 500 }), admin.rpc("claim_digest_batch")]);
     if (instant.error) stats.errors.push(`email: ${instant.error.message}`);
     if (digest.error) stats.errors.push(`résumé: ${digest.error.message}`);

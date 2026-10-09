@@ -46,19 +46,41 @@ export async function addContract(_: ActionResult | null, fd: FormData): Promise
   const start = str(fd, "start_date");
   if (!profile || !start) return fail("Employé et date de début requis.");
   const supabase = await createClient();
+  // Le contrat naît en brouillon ; le salaire convenu ne s'applique qu'à la signature.
   const { error } = await supabase.from("employment_contracts").insert({
     profile_id: profile, type: str(fd, "type") ?? "cdi", job_title: str(fd, "job_title"), start_date: start,
     end_date: str(fd, "end_date"), weekly_hours: numVal(fd, "weekly_hours") ?? 40, notes: str(fd, "notes"),
+    gross_monthly: numVal(fd, "gross_monthly"),
   });
   if (error) return fail(error);
-  const salary = numVal(fd, "gross_monthly");
-  if (salary) {
-    const { error: e2 } = await supabase.from("salaries").insert({ profile_id: profile, gross_monthly: salary, effective_from: start });
-    if (e2) return fail(e2);
-  }
   refresh();
   revalidatePath(`/annuaire/${profile}`);
-  return ok("Contrat enregistré.");
+  return ok("Contrat enregistré en brouillon : soumettez-le à l'accord du CEO, puis signez-le.");
+}
+
+export async function submitEmploymentContract(id: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.rpc("submit_employment_contract", { p_contract: id, p_justification: null });
+  if (error) return fail(error);
+  refresh();
+  revalidatePath("/validations");
+  return ok("Contrat transmis au CEO.");
+}
+
+export async function signEmploymentContract(id: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.from("employment_contracts").update({ status: "signed" }).eq("id", id);
+  if (error) return fail(error);
+  refresh();
+  return ok("Contrat signé : la rémunération convenue s'applique.");
+}
+
+export async function endEmploymentContract(id: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.from("employment_contracts").update({ status: "ended" }).eq("id", id);
+  if (error) return fail(error);
+  refresh();
+  return ok("Contrat clos.");
 }
 
 export async function addSalary(_: ActionResult | null, fd: FormData): Promise<ActionResult> {

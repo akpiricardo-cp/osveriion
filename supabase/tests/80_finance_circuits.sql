@@ -165,3 +165,33 @@ do $$ begin
   end if;
   raise notice 'OK : un contrat échu passe automatiquement « expiré »';
 end $$;
+
+-- ── Vues d'appui : accord caduc, accords disponibles, santé ───────────────
+select pg_temp.as_user('00000000-0000-0000-0000-0000000000a1');
+select public.decide_approval((select id from approval_requests where kind = 'budget' and status = 'pending'), true, 'ok');
+reset role;
+select pg_temp.as_user('00000000-0000-0000-0000-0000000000c1');
+update budgets set status = 'draft', amount = 9500000 where id = '44444444-4444-4444-4444-444444444442';
+do $$ begin
+  if not (select stale from approval_requests_status where kind = 'budget' and subject_id = '44444444-4444-4444-4444-444444444442') then
+    raise exception 'ERREUR: accord non signalé caduc après modification du montant';
+  end if;
+  raise notice 'OK : un accord devient caduc quand le contenu change';
+end $$;
+select public.request_approval('expense', null, 'Matériel', 900000);
+reset role;
+select pg_temp.as_user('00000000-0000-0000-0000-0000000000a1');
+select public.decide_approval((select id from approval_requests where kind = 'expense' and subject_label = 'Matériel'), true, 'ok');
+reset role;
+select pg_temp.as_user('00000000-0000-0000-0000-0000000000c1');
+do $$ begin
+  if (select remaining from public.available_expense_approvals() where subject_label = 'Matériel') <> 900000 then
+    raise exception 'ERREUR: accord de dépense disponible mal calculé';
+  end if;
+  raise notice 'OK : accords de dépense disponibles listés avec leur reste';
+end $$;
+reset role;
+do $$ begin
+  if (public.ops_health()->>'database') <> 'ok' then raise exception 'ERREUR: ops_health'; end if;
+  raise notice 'OK : point de santé opérationnel';
+end $$;

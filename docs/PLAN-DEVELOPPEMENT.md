@@ -3,6 +3,12 @@
 > Établi le 9 octobre 2026, à partir de l'audit [`AUDIT-OS-VERIION.md`](AUDIT-OS-VERIION.md).
 > Ce document traduit les phases de l'audit en **lots livrables** : pour chacun, ce qu'il faut changer (base, serveur, écrans), comment le vérifier et de quels autres lots il dépend.
 
+## État d'avancement
+
+| Phase | État | Remarques |
+| --- | --- | --- |
+| **Phase 0 — Gouvernance fiable** | ✅ Livrée (migrations 11 à 15, interface, CI) | Les six contournements de l'audit sont refusés (`supabase/tests/70_gouvernance.sql`). Reste hors code : création des environnements dev / préprod, PITR et suivi d'erreurs (voir `docs/EXPLOITATION.md`). Les types TypeScript ne sont pas encore générés depuis la base (`supabase gen types` exige la CLI Supabase et Docker) : `src/lib/types.ts` reste maintenu à la main. |
+
 ---
 
 ## Sommaire

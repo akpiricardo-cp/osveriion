@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { fail, ok, str } from "@/lib/actions";
+import { fail, numVal, ok, str } from "@/lib/actions";
 import { ACCESS_CODE_RULE } from "@/lib/access-code";
 import { lockSession, unlockSession } from "@/lib/server/unlock";
 import { NOTIFICATION_CATEGORIES, type NotificationPreferences } from "@/lib/notifications";
@@ -52,7 +52,7 @@ export async function sendTestPush(): Promise<ActionResult> {
     profile_id: user.id, kind: "test", title: "Notification de test", body: "Les notifications VERIION OS fonctionnent sur cet appareil.", link: "/parametres?onglet=notifications",
   });
   if (error) return fail(error);
-  const stats = await dispatchNotifications();
+  const stats = await dispatchNotifications({ onlyProfile: user.id, pushOnly: true });
   if (!stats.push) return fail(stats.errors[0] ?? "Aucune notification n'a pu être envoyée (plage « ne pas déranger » ou catégorie désactivée ?).");
   return ok(`Notification envoyée sur ${stats.push} appareil${stats.push > 1 ? "s" : ""}.`);
 }
@@ -99,4 +99,33 @@ export async function changeAccessCode(_: ActionResult | null, fd: FormData): Pr
 export async function lockSpaceNow(): Promise<never> {
   await lockSession();
   redirect("/verrou");
+}
+
+/** Paramètres de gouvernance (CEO, double authentification exigée par la base). */
+export async function saveGovernance(_: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  const threshold = numVal(fd, "ceo_approval_threshold");
+  const reminder = numVal(fd, "approval_reminder_days");
+  const maxGrant = numVal(fd, "max_grant_days");
+  if (threshold === null || threshold < 0) return fail("Seuil invalide.");
+  if (!reminder || reminder < 1 || reminder > 30) return fail("Relance : entre 1 et 30 jours.");
+  if (!maxGrant || maxGrant < 1 || maxGrant > 366) return fail("Dérogation : entre 1 et 366 jours.");
+  const supabase = await createClient();
+  const { data, error } = await supabase.from("governance_settings").update({
+    ceo_approval_threshold: threshold,
+    approval_reminder_days: Math.round(reminder),
+    max_grant_days: Math.round(maxGrant),
+    mfa_enforced: str(fd, "mfa_enforced") !== "off",
+  }).eq("id", true).select("id");
+  if (error) return fail(error);
+  if (!data?.length) return fail("Réservé au CEO, après validation de la double authentification.");
+  revalidatePath("/", "layout");
+  return ok("Règles de gouvernance enregistrées.");
+}
+
+export async function transferCeo(successorId: string): Promise<ActionResult> {
+  const supabase = await createClient();
+  const { error } = await supabase.rpc("transfer_ceo", { p_to: successorId });
+  if (error) return fail(error);
+  revalidatePath("/", "layout");
+  return ok("Fonction transmise : votre successeur est désormais CEO.");
 }

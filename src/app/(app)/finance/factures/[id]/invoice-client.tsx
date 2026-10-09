@@ -9,7 +9,7 @@ import type { InvoiceStatus } from "@/lib/types";
 import { money } from "@/lib/utils";
 import { addInvoiceLine, deleteInvoiceLine, setInvoiceStatus } from "../../actions";
 
-export function InvoiceActions({ id, status, admin }: { id: string; status: InvoiceStatus; admin: boolean }) {
+export function InvoiceActions({ id, status, admin, everSent }: { id: string; status: InvoiceStatus; admin: boolean; everSent: boolean }) {
   const [pending, start] = useTransition();
   const go = (s: InvoiceStatus, confirmMsg?: string) => {
     if (confirmMsg && !confirm(confirmMsg)) return;
@@ -20,9 +20,9 @@ export function InvoiceActions({ id, status, admin }: { id: string; status: Invo
       <Button size="sm" variant="outline" onClick={() => window.print()}><Printer className="h-4 w-4" /> Imprimer / PDF</Button>
       {admin && status === "draft" && <Button size="sm" loading={pending} onClick={() => go("sent")}><Send className="h-4 w-4" /> Marquer envoyée</Button>}
       {admin && (status === "sent" || status === "overdue") && <Button size="sm" variant="success" loading={pending} onClick={() => go("paid", "Confirmer l'encaissement ? Le revenu sera comptabilisé automatiquement.")}><CheckCircle2 className="h-4 w-4" /> Encaissée</Button>}
-      {admin && status === "paid" && <Button size="sm" variant="outline" loading={pending} onClick={() => go("sent", "Annuler l'encaissement ? Le revenu associé sera retiré.")}><Undo2 className="h-4 w-4" /> Annuler l&apos;encaissement</Button>}
-      {admin && status !== "cancelled" && status !== "paid" && <Button size="sm" variant="ghost" loading={pending} onClick={() => go("cancelled", "Annuler cette facture ?")}><Ban className="h-4 w-4" /></Button>}
-      {admin && status === "cancelled" && <Button size="sm" variant="outline" loading={pending} onClick={() => go("draft")}>Rouvrir</Button>}
+      {admin && status === "paid" && <Button size="sm" variant="outline" loading={pending} onClick={() => go("sent", "Annuler l'encaissement ? Une écriture inverse (contre-passation) sera passée : le revenu reste tracé.")}><Undo2 className="h-4 w-4" /> Annuler l&apos;encaissement</Button>}
+      {admin && status !== "cancelled" && status !== "paid" && <Button size="sm" variant="ghost" loading={pending} onClick={() => go("cancelled", status === "draft" ? "Annuler ce brouillon ?" : "Annuler cette facture émise ? Elle restera numérotée et visible ; établissez-en une nouvelle si besoin.")}><Ban className="h-4 w-4" /></Button>}
+      {admin && status === "cancelled" && !everSent && <Button size="sm" variant="outline" loading={pending} onClick={() => go("draft")}>Rouvrir</Button>}
     </>
   );
 }

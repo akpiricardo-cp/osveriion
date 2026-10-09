@@ -194,6 +194,10 @@ export interface Transaction {
   product: string | null;
   country: string | null;
   reference: string | null;
+  approval_id?: string | null;
+  reverses_id?: string | null;
+  reversed_by?: string | null;
+  reversal_reason?: string | null;
 }
 
 export interface DocumentRow {
@@ -348,7 +352,22 @@ export interface ApprovalRequest {
   decided_by: string | null;
   decided_at: string | null;
   decision_note: string | null;
+  subject_snapshot: Record<string, unknown> | null;
+  subject_hash: string | null;
+  consumed_amount: number;
+  direct_decision: boolean;
+  /** Vrai si le contenu a changé depuis l'accord (vue approval_requests_status). */
+  stale?: boolean;
   created_at: string;
+}
+
+export interface GovernanceSettings {
+  ceo_approval_threshold: number;
+  approval_reminder_days: number;
+  max_grant_days: number;
+  mfa_enforced: boolean;
+  updated_at: string;
+  updated_by: string | null;
 }
 
 export interface OperationCycle {
