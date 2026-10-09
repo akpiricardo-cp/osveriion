@@ -5,10 +5,10 @@ insert into auth.users (id, email) values
  ('00000000-0000-0000-0000-0000000000e2', 'fatou.ops@veriion.com');
 select full_name from profiles order by 1;
 create or replace function pg_temp.as_user(u text) returns void language plpgsql as $$
-begin perform set_config('request.jwt.claim.sub', u, false); execute 'set role authenticated'; end $$;
+begin perform set_config('request.jwt.claim.sub', u, false); perform set_config('request.jwt.claims', '{"aal":"aal2"}', false); execute 'set role authenticated'; end $$;
 select pg_temp.as_user('00000000-0000-0000-0000-00000000000a');
 select public.appoint_member((select id from org_units where code='BIZ-COM'), '00000000-0000-0000-0000-0000000000e1', 'member');
-select public.appoint_member((select id from org_units where code='OPS-PMO'), '00000000-0000-0000-0000-0000000000e2', 'member');
+select public.appoint_member((select id from org_units where code='OPS-PLN'), '00000000-0000-0000-0000-0000000000e2', 'member');
 insert into objectives (level, title) values ('company', 'Atteindre 1 M d''utilisateurs') returning id, period;
 insert into key_results (objective_id, title, start_value, target_value, current_value) select id, 'Utilisateurs actifs', 0, 1000000, 250000 from objectives;
 select title, progress from objectives_progress;
@@ -22,6 +22,7 @@ insert into interactions (account_id, subject, kind) select id, 'Appel de décou
 insert into channels (name, is_private) values ('ventes-privé', true) returning id, kind;
 insert into channel_members (channel_id, profile_id) select id, '00000000-0000-0000-0000-0000000000e2' from channels where name='ventes-privé' returning channel_id;
 insert into projects (name) values ('Projet perso') returning id, code;
+insert into project_members (project_id, profile_id) select id, '00000000-0000-0000-0000-0000000000e2' from projects where name='Projet perso';
 insert into tasks (project_id, title, assignee_id) select id, 'Tâche 1', '00000000-0000-0000-0000-0000000000e2' from projects where name='Projet perso' returning id;
 insert into documents (title, classification, unit_id, storage_path) values ('Proposition commerciale', 'restricted', (select id from org_units where code='BIZ'), '00000000-0000-0000-0000-0000000000e1/prop.pdf') returning id;
 insert into storage.objects (bucket_id, name) values ('documents', '00000000-0000-0000-0000-0000000000e1/prop.pdf') returning id;

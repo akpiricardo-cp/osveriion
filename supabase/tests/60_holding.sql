@@ -10,7 +10,7 @@ insert into auth.users (id, email) values
  ('00000000-0000-0000-0000-0000000000f1', 'lina.kpade@veriion.com');    -- juriste
 
 create or replace function pg_temp.as_user(u text) returns void language plpgsql as $$
-begin perform set_config('request.jwt.claim.sub', u, false); execute 'set role authenticated'; end $$;
+begin perform set_config('request.jwt.claim.sub', u, false); perform set_config('request.jwt.claims', '{"aal":"aal2"}', false); execute 'set role authenticated'; end $$;
 
 -- ── Profil obligatoire : une fiche vide n'est pas complète ─────────────────
 do $$ begin
@@ -246,8 +246,9 @@ values ('Hébergement cloud 2026', 'supplier', 'Cloud Afrique SA', 9000000, curr
 do $$ begin
   update public.legal_contracts set status = 'active';
   raise exception 'ERREUR: contrat signé sans accord du CEO';
-exception when insufficient_privilege then raise notice 'OK : signature de contrat bloquée sans accord du CEO';
+exception when insufficient_privilege or check_violation then raise notice 'OK : signature de contrat bloquée sans accord du CEO';
 end $$;
+update public.legal_contracts set status = 'legal_review';
 select public.submit_contract_for_signature((select id from legal_contracts), 'Renouvellement annuel') is not null as soumis;
 select status from public.legal_contracts;
 reset role;

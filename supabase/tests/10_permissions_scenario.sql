@@ -10,7 +10,7 @@ select email, system_role, full_name from public.profiles order by email;
 
 create or replace function pg_temp.as_user(u text) returns void language plpgsql as $$
 begin
-  perform set_config('request.jwt.claim.sub', u, false);
+  perform set_config('request.jwt.claim.sub', u, false); perform set_config('request.jwt.claims', '{"aal":"aal2"}', false);
   execute 'set role authenticated';
 end $$;
 
@@ -30,7 +30,7 @@ union all select 'cfo unit.manage FIN-CPT', public.has_perm('unit.manage', (sele
 union all select 'cfo unit.manage MKT', public.has_perm('unit.manage', (select id from org_units where code='MKT'))
 union all select 'cfo crm.view', public.has_perm('crm.view');
 insert into budgets (unit_id, fiscal_year, amount) values ((select id from org_units where code='MKT'), 2026, 50000000);
-insert into transactions (type, amount, category, unit_id, occurred_on) values ('expense', 1200000, 'Publicité', (select id from org_units where code='MKT-ACQ'), '2026-03-10');
+insert into transactions (type, amount, category, unit_id, occurred_on) values ('expense', 400000, 'Publicité', (select id from org_units where code='MKT-ACQ'), '2026-03-10');
 insert into transactions (type, amount, category, product, country, occurred_on) values ('revenue', 9000000, 'Ventes', 'Oniix', 'BJ', '2026-04-02');
 select count(*) as cfo_sees_transactions from transactions;
 reset role;
@@ -54,7 +54,7 @@ do $$ begin
 exception when insufficient_privilege then raise notice 'OK : CMO ne peut pas se nommer à la Finance';
 end $$;
 -- Le CMO crée un projet dans son unité
-insert into projects (name, unit_id, status, due_date) values ('Campagne Q4', (select id from org_units where code='MKT'), 'active', '2026-01-01') ;
+insert into projects (name, unit_id, status, due_date) values ('Campagne Q4', (select id from org_units where code='MKT'), 'planned', '2026-01-01') ;
 reset role;
 
 -- ===== Développeur
@@ -103,6 +103,7 @@ insert into accounts (name, type, country) values ('Ministère du Numérique', '
 insert into opportunities (account_id, name, amount, stage, product) select id, 'Plateforme e-éducation', 25000000, 'negotiation', 'iSkul' from accounts;
 update opportunities set stage = 'won';
 select a.type, o.probability, o.project_id is not null as projet, i.number, i.subtotal, i.total, i.status from opportunities o join accounts a on a.id=o.account_id join invoices i on i.opportunity_id=o.id;
+update invoices set status='sent';
 update invoices set status='paid';
 select type, amount, reference from transactions where invoice_id is not null;
 insert into product_metrics (metric_date, active_users, new_users) values (current_date - 31, 10000, 500), (current_date, 12500, 700);

@@ -4,7 +4,7 @@ insert into auth.users (id, email) values
  ('00000000-0000-0000-0000-00000000000a', 'awa.houngbo@veriion.com'),   -- premier compte => CEO
  ('00000000-0000-0000-0000-0000000000b1', 'koffi.adjovi@veriion.com');
 create or replace function pg_temp.as_user(u text) returns void language plpgsql as $$
-begin perform set_config('request.jwt.claim.sub', u, false); execute 'set role authenticated'; end $$;
+begin perform set_config('request.jwt.claim.sub', u, false); perform set_config('request.jwt.claims', '{"aal":"aal2"}', false); execute 'set role authenticated'; end $$;
 
 -- ── Forme du code ──────────────────────────────────────────────────────────
 select code, public.access_code_valid(code) as accepte

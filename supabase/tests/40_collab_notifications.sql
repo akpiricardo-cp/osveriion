@@ -6,7 +6,7 @@ insert into auth.users (id, email) values
  ('00000000-0000-0000-0000-0000000000c1', 'nadia.sossa@veriion.com'),
  ('00000000-0000-0000-0000-0000000000d1', 'yann.agbo@veriion.com');
 create or replace function pg_temp.as_user(u text) returns void language plpgsql as $$
-begin perform set_config('request.jwt.claim.sub', u, false); execute 'set role authenticated'; end $$;
+begin perform set_config('request.jwt.claim.sub', u, false); perform set_config('request.jwt.claims', '{"aal":"aal2"}', false); execute 'set role authenticated'; end $$;
 select pg_temp.as_user('00000000-0000-0000-0000-00000000000a');
 select public.appoint_member((select id from org_units where code='MKT'), '00000000-0000-0000-0000-0000000000c1', 'head', 'CMO');
 select public.appoint_member((select id from org_units where code='MKT-ACQ'), '00000000-0000-0000-0000-0000000000d1', 'member');

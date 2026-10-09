@@ -8,13 +8,25 @@ create table auth.users (
   id uuid primary key default gen_random_uuid(),
   email text unique,
   raw_user_meta_data jsonb default '{}'::jsonb,
+  invited_at timestamptz,
   created_at timestamptz default now()
 );
 create function auth.uid() returns uuid language sql stable as $$
   select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
 $$;
+-- Revendications du jeton (dont « aal » : niveau d'authentification, aal2 = double authentification).
+create function auth.jwt() returns jsonb language sql stable as $$
+  select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb
+$$;
 grant usage on schema auth to authenticated, anon;
-grant execute on function auth.uid() to authenticated, anon;
+grant execute on function auth.uid(), auth.jwt() to authenticated, anon;
+
+-- Comme sur Supabase : les objets créés dans « public » sont accordés par défaut
+-- aux rôles de l'API. Les migrations doivent donc retirer explicitement ce que
+-- « anon » ne doit pas voir.
+alter default privileges in schema public grant all on tables    to anon, authenticated, service_role;
+alter default privileges in schema public grant all on sequences to anon, authenticated, service_role;
+alter default privileges in schema public grant all on functions to anon, authenticated, service_role;
 
 create schema storage;
 create table storage.buckets (id text primary key, name text, public boolean, file_size_limit bigint);
